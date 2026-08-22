@@ -9,7 +9,7 @@
 -- writes into Ritter - no addDisease / injection; all reads only).
 -- =========================================================
 
-RLBridge = {}
+RLBridge = RLBridge or {}
 
 function RLBridge:init()
     -- Presence: prefer the reliable loaded-in-this-save check (g_modIsLoaded) over a

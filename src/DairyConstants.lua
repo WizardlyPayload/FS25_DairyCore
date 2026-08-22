@@ -11,7 +11,7 @@
 -- before treating them as final.
 -- =========================================================
 
-DairyConstants = {}
+DairyConstants = DairyConstants or {}
 
 -- Milk quality tiers, evaluated from the herd health score (0-100).
 DairyConstants.QUALITY = {

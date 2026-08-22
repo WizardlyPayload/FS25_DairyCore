@@ -11,7 +11,14 @@
 -- neutral when a companion is absent.
 -- =========================================================
 
-local modDirectory = g_currentModDirectory
+-- Hot-reload latch (FuelCosts reference): g_currentModDirectory and
+-- g_currentModName are nil on a live re-source, so they are latched into
+-- module globals on first load, with a g_modsDirectory loose-folder fallback.
+DairyCoreModDirectory = DairyCoreModDirectory
+    or g_currentModDirectory
+    or (g_modsDirectory ~= nil and (g_modsDirectory .. "FS25_DairyCore/") or nil)
+DairyCoreModName = DairyCoreModName or g_currentModName or "FS25_DairyCore"
+local modDirectory = DairyCoreModDirectory
 
 source(modDirectory .. "src/Logger.lua")
 source(modDirectory .. "src/DairyConstants.lua")
@@ -20,11 +27,11 @@ source(modDirectory .. "src/FeedProvenance.lua")
 source(modDirectory .. "src/DairyCoreManager.lua")
 
 -- Esc RF PDA framework joiner (NO-HOST).
-source(g_currentModDirectory .. "src/gui/RfEscModules.lua")
-source(g_currentModDirectory .. "src/gui/RfPdaMenuPage.lua")
-source(g_currentModDirectory .. "src/gui/RfEscBootstrap.lua")
-source(g_currentModDirectory .. "src/gui/RfEscUiDebugger.lua")
-source(g_currentModDirectory .. "src/gui/DairyRfPdaGuest.lua")
+source(DairyCoreModDirectory .. "src/gui/RfEscModules.lua")
+source(DairyCoreModDirectory .. "src/gui/RfPdaMenuPage.lua")
+source(DairyCoreModDirectory .. "src/gui/RfEscBootstrap.lua")
+source(DairyCoreModDirectory .. "src/gui/RfEscUiDebugger.lua")
+source(DairyCoreModDirectory .. "src/gui/DairyRfPdaGuest.lua")
 
 local dairyCore = DairyCoreManager.new()
 getfenv(0)["g_dairyCoreManager"] = dairyCore
