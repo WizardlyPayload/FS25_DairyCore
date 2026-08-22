@@ -9,7 +9,7 @@
 -- the base game addMoney (server); TaxMod recordExpense is audit-only.
 -- =========================================================
 
-DairyCoreManager = {}
+DairyCoreManager = DairyCoreManager or {}
 local DairyCoreManager_mt = Class(DairyCoreManager)
 
 DairyCoreManager.LEDGER_BARNS     = "DairyCore_BarnState"

@@ -21,7 +21,7 @@
 -- is absent. Fraction writes and the effects are server-side.
 -- =========================================================
 
-FeedProvenance = {}
+FeedProvenance = FeedProvenance or {}
 local FeedProvenance_mt = Class(FeedProvenance)
 
 function FeedProvenance.new(manager)

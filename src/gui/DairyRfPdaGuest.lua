@@ -5,10 +5,10 @@
 -- Barn human-name polish HELD (Col A = barnId). No earned-tier invent.
 -- =========================================================
 
-DairyRfPdaGuest = {}
+DairyRfPdaGuest = DairyRfPdaGuest or {}
 
-local MOD_DIR = g_currentModDirectory
-local MOD_NAME = g_currentModName
+local MOD_DIR = (DairyCoreModDirectory or g_currentModDirectory)
+local MOD_NAME = (DairyCoreModName or g_currentModName)
 local PANEL_ID = "dairy"
 local PANEL_ORDER = 70
 local MAX_ROWS = 8
@@ -364,7 +364,13 @@ function DairyRfPdaGuest.onShow(container, lightOnly)
     setText(findDescendant(container, "rfFwTableTitle"), "")
     setVis(findDescendant(container, "rfFwTableTitle"), false)
     setText(findDescendant(container, "rfFwColA"), tr("dairy_rf_pda_col_barn", "Barn"))
-    setText(findDescendant(container, "rfFwColB"), tr("dairy_rf_pda_col_health", "Herd"))
+    -- BUILD 09:19 (PB-09). This header said "Herd" over a 0-100 health SCORE, so an empty
+    -- barn read "Herd 60" on this page while the base Animals page said, truthfully, that
+    -- there were no animals in it. Two RF pages, one save, flatly contradicting each other.
+    -- The score is real and worth showing; only the label was lying about what it counts.
+    -- Relabelled rather than swapped for a live head count, per George's constraint and
+    -- Sam's anti-law: a head count must never be fabricated out of herdHealth.
+    setText(findDescendant(container, "rfFwColB"), tr("dairy_rf_pda_col_health", "Herd Health"))
     setText(findDescendant(container, "rfFwColC"), tr("dairy_rf_pda_col_tier", "Sale quality"))
     setText(findDescendant(container, "rfFwColD"), tr("dairy_rf_pda_col_spoil", "Spoilage"))
 
@@ -406,7 +412,18 @@ function DairyRfPdaGuest.onShow(container, lightOnly)
             setVis(a, true); setVis(b, true); setVis(c, true); setVis(d, true)
             -- George HOLD getName=rename-only: soft-try human fields, else truncate barnId.
             setText(a, barnLabel(r))
-            setText(b, tostring(r.herdHealth or 0))
+            -- BUILD 09:19 (PB-09). "60" alone still reads as a count even under a corrected
+            -- header, because a bare integer in a barn table looks like animals. The
+            -- denominator is what makes it unmistakably a score, and it is the real bound:
+            -- DairyConstants.HERD.SCORE_MIN 0 / SCORE_MAX 100, the same clamp
+            -- DairyCoreManager applies when it writes herdHealthScore. Read from the
+            -- constant rather than typed as a literal so the two can never drift.
+            local scoreMax = 100
+            if DairyConstants ~= nil and DairyConstants.HERD ~= nil
+                and type(DairyConstants.HERD.SCORE_MAX) == "number" then
+                scoreMax = DairyConstants.HERD.SCORE_MAX
+            end
+            setText(b, string.format("%d/%d", math.floor(tonumber(r.herdHealth) or 0), scoreMax))
             -- Live qualityTier is already effective / post-spoilage sale tier.
             -- Live qualityTier is already effective / post-spoilage sale tier. The
             -- row carries the KEY (dc_tier_*); translate it here (DC-14 invariant 3).
