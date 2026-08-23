@@ -16,6 +16,13 @@ the repo's git history and README.
 ### Added
 - Changelog file established (suite ruling 2026-08-22).
 
+### Fixed
+- Feed-field bonuses and penalties plus the mycotoxin penalty now apply in both
+  Standard and RealisticLivestock (Ritter) modes. They previously ran only in the
+  Standard score path, so a Ritter-mode farm was silently exempt (DC-11 placement).
+- Un-designating a feed field now syncs to co-op partners immediately, matching
+  the designation path (F106).
+
 ## [1.0.5.4] - 2026-08-22
 
 - First entry under changelog tracking.
