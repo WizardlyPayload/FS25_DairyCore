@@ -6,6 +6,7 @@
 
 ## Features / enhancements
 
+- [x] Feed modifiers + mycotoxin apply in both modes (DC-11 4A placement, 2026-08-23): the mode-independent farm-business layer (`_farmBusinessModifiers`) now applies feed-field bonuses and penalties plus the mycotoxin penalty after either score path (Standard or Ritter/RL), and F106 makes `undesignateFeedField` dirty-mark symmetric with `designateFeedField`. 439 suite assertions green. On `feat/DC-11-feed-business-layer`, PR opening.
 - [x] Esc framework table freeze (Dairy guest, #30): shared grid restated per show; 1.0.5.4.
 - [~] In-game: Dairy table keeps its columns after visiting another Esc guest in the same session.
 ## Features / enhancements

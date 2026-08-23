@@ -553,6 +553,14 @@ function DairyCoreManager:_updateBarnHealth(barn)
         barn.herdHealthScore_RitterSource = false
     end
 
+    -- DC-11 4A: mode-independent farm-business modifiers. Feed-field bonuses and
+    -- penalties plus the mycotoxin subtraction apply after either score path, so
+    -- a Ritter-mode farm is not silently exempt (addendum 2026-08-14). The deltas
+    -- land before the ProStaff global scale, exactly where the feed terms sat
+    -- inside the Standard path.
+    local feedDelta, qualityDelta = self:_farmBusinessModifiers(barn)
+    score = score + feedDelta + qualityDelta
+
     -- ProStaff global effectiveness (L20 supersedes L19; do not stack).
     local level = self:_proStaffLevel()
     if level >= 20 then
@@ -566,8 +574,10 @@ function DairyCoreManager:_updateBarnHealth(barn)
     barn.milkQualityTier = self:_qualityTierForScore(barn.herdHealthScore).key
 end
 
--- Standard mode: base-game globalProductionFactor + SoilFertilizer feed-field
--- modifiers + mycotoxin penalty + ProStaff L12 quality bump.
+-- Standard mode: base-game globalProductionFactor + ProStaff L12 quality bump.
+-- The SoilFertilizer feed-field modifiers and the mycotoxin penalty are NOT here:
+-- they live in the mode-independent farm-business layer (_farmBusinessModifiers)
+-- which _updateBarnHealth applies after either score path (DC-11 4A).
 function DairyCoreManager:_herdScoreStandard(barn)
     local base = 60
     pcall(function()
@@ -579,6 +589,24 @@ function DairyCoreManager:_herdScoreStandard(barn)
 
     local score = base
     local qualityBonus = 0
+
+    -- ProStaff L12 precision agronomy: +5% feed crop quality.
+    if self:_proStaffLevel() >= 12 then
+        qualityBonus = qualityBonus + (base * (DairyConstants.PROSTAFF.L12_QUALITY - 1.0))
+    end
+
+    return score + qualityBonus
+end
+
+-- DC-11 4A: the mode-independent farm-business modifier layer. The feed-field
+-- bonuses and penalties plus the mycotoxin subtraction apply AFTER either score
+-- path resolves (Standard or Ritter/RL), never inside _herdScoreStandard, which
+-- Ritter-mode saves skip entirely (the Ritter bypass at DairyCoreManager.lua:374-378;
+-- brief fold 2026-08-05; addendum 2026-08-14). Returns the two deltas the caller
+-- adds to the resolved score before the ProStaff global scale.
+function DairyCoreManager:_farmBusinessModifiers(barn)
+    local scoreDelta = 0
+    local qualityDelta = 0
 
     -- SoilFertilizer reads on designated feed fields only.
     local balancedAll, anyLowOM, anySevereOM, anyWeed, anyLegume = true, false, false, false, false
@@ -606,22 +634,17 @@ function DairyCoreManager:_herdScoreStandard(barn)
     end
 
     if hasFields then
-        if balancedAll then score = score + DairyConstants.HERD.BALANCED_NPK_BONUS end
-        if anySevereOM then score = score - DairyConstants.HERD.OM_SEVERE_PEN
-        elseif anyLowOM then score = score - DairyConstants.HERD.OM_DEPLETED_PEN end
-        if anyWeed then qualityBonus = qualityBonus - DairyConstants.HERD.WEED_QUALITY_PEN end
-        if anyLegume then qualityBonus = qualityBonus + DairyConstants.HERD.LEGUME_QUALITY_FLOOR_BONUS end
+        if balancedAll then scoreDelta = scoreDelta + DairyConstants.HERD.BALANCED_NPK_BONUS end
+        if anySevereOM then scoreDelta = scoreDelta - DairyConstants.HERD.OM_SEVERE_PEN
+        elseif anyLowOM then scoreDelta = scoreDelta - DairyConstants.HERD.OM_DEPLETED_PEN end
+        if anyWeed then qualityDelta = qualityDelta - DairyConstants.HERD.WEED_QUALITY_PEN end
+        if anyLegume then qualityDelta = qualityDelta + DairyConstants.HERD.LEGUME_QUALITY_FLOOR_BONUS end
     end
 
     -- Mycotoxin penalty (both modes).
-    score = score - (barn.mycotoxinPenalty or 0)
+    scoreDelta = scoreDelta - (barn.mycotoxinPenalty or 0)
 
-    -- ProStaff L12 precision agronomy: +5% feed crop quality.
-    if self:_proStaffLevel() >= 12 then
-        qualityBonus = qualityBonus + (base * (DairyConstants.PROSTAFF.L12_QUALITY - 1.0))
-    end
-
-    return score + qualityBonus
+    return scoreDelta, qualityDelta
 end
 
 -- =========================================================
@@ -1015,6 +1038,9 @@ function DairyCoreManager:undesignateFeedField(barnId, fieldId)
     local barn = self.barns[barnId]
     if barn == nil then return false end
     barn.feedSourceFields[fieldId] = nil
+    -- F106: symmetric with designateFeedField. Without the dirty mark a connected
+    -- co-op partner sees the undesignation lag until the next day tick.
+    self:_markBarnsDirty()
     return true
 end
 
