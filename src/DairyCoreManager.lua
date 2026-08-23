@@ -1027,6 +1027,11 @@ end
 -- =========================================================
 
 function DairyCoreManager:designateFeedField(barnId, fieldId)
+    -- DC-11: writes to barn state must land on the server. A client calling this
+    -- would mutate its local mirror, which the next CHANNEL_BARNS sync overwrites,
+    -- and _markBarnsDirty already refuses to mark on a client, so the change would
+    -- be both lost and silently inconsistent. Same gate every other write uses.
+    if not self:_isServer() then return false end
     local barn = self.barns[barnId]
     if barn == nil then return false end
     barn.feedSourceFields[fieldId] = true
@@ -1035,6 +1040,7 @@ function DairyCoreManager:designateFeedField(barnId, fieldId)
 end
 
 function DairyCoreManager:undesignateFeedField(barnId, fieldId)
+    if not self:_isServer() then return false end
     local barn = self.barns[barnId]
     if barn == nil then return false end
     barn.feedSourceFields[fieldId] = nil
@@ -1042,6 +1048,67 @@ function DairyCoreManager:undesignateFeedField(barnId, fieldId)
     -- co-op partner sees the undesignation lag until the next day tick.
     self:_markBarnsDirty()
     return true
+end
+
+-- DC-11 read API for the designation surface. Enumerates the farm's own fields
+-- (via g_fieldManager farmland ownership, the same idiom SoilFertilizer's own
+-- panel uses) and attaches the live state the picker must show: organic matter,
+-- NPK status, weed pressure, rotation, disease. Neutral and empty when SoilFertilizer
+-- is absent, exactly like the scoring read it feeds.
+function DairyCoreManager:getOwnedFeedFields(farmId)
+    local out = {}
+    if type(farmId) ~= "number" or farmId <= 0 then return out end
+    if g_fieldManager == nil or g_fieldManager.fields == nil then return out end
+
+    local fieldIds = {}
+    local seen = {}
+    for _, f in ipairs(g_fieldManager.fields) do
+        if f ~= nil and f.farmland ~= nil and f.farmland.id ~= nil then
+            local fid = f.farmland.id
+            if not seen[fid] then
+                seen[fid] = true
+                fieldIds[#fieldIds + 1] = fid
+            end
+        end
+    end
+    table.sort(fieldIds)
+
+    local farmland = g_farmlandManager
+    for _, fid in ipairs(fieldIds) do
+        local owner = nil
+        if farmland ~= nil and farmland.getFarmlandOwner ~= nil then
+            pcall(function() owner = farmland:getFarmlandOwner(fid) end)
+        end
+        if owner == farmId then
+            local info = self:_getFieldInfo(fid) or {}
+            out[#out + 1] = {
+                fieldId = fid,
+                organicMatter = info.organicMatter,
+                nitrogen = info.nitrogen,
+                phosphorus = info.phosphorus,
+                potassium = info.potassium,
+                weedPressure = info.weedPressure,
+                rotationStatus = info.rotationStatus,
+                diseasePressure = info.diseasePressure,
+                activeDisease = info.activeDisease,
+                diseaseDiscovered = info.diseaseDiscovered,
+            }
+        end
+    end
+    return out
+end
+
+-- DC-11 read API: the barn's current designation set as a sorted list, plus the
+-- feed-field count (the number the herd score actually reads).
+function DairyCoreManager:getBarnDesignations(barnId)
+    local barn = self.barns[barnId]
+    if barn == nil then return {}, 0 end
+    local ids = {}
+    for fieldId in pairs(barn.feedSourceFields) do
+        ids[#ids + 1] = fieldId
+    end
+    table.sort(ids)
+    return ids, #ids
 end
 
 -- Inbound broadcast from CropDisease / SF disease layer.

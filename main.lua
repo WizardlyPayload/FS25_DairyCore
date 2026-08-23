@@ -32,6 +32,7 @@ source(DairyCoreModDirectory .. "src/gui/RfPdaMenuPage.lua")
 source(DairyCoreModDirectory .. "src/gui/RfEscBootstrap.lua")
 source(DairyCoreModDirectory .. "src/gui/RfEscUiDebugger.lua")
 source(DairyCoreModDirectory .. "src/gui/DairyRfPdaGuest.lua")
+source(DairyCoreModDirectory .. "src/gui/FeedDesignationDialog.lua")
 
 local dairyCore = DairyCoreManager.new()
 getfenv(0)["g_dairyCoreManager"] = dairyCore

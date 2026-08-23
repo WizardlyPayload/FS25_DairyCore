@@ -6,6 +6,12 @@
 
 ## Features / enhancements
 
+- [x] Feed-field designation surface (DC-11 section 3.1, 2026-08-23): deep engine
+  dialog opened from the Dairy Esc glance ("Feed Fields" footer button) lists owned
+  fields with live SF state and Toggle calls the already-built designate/undesignate.
+  Server-gated writes; reads via `getOwnedFeedFields` / `getBarnDesignations`. 24 new
+  assertions in `dc11_designation_surface_test.lua`. The herd score now has a way to
+  move; this was the last DC-15 predecessor.
 - [x] Feed modifiers + mycotoxin apply in both modes (DC-11 4A placement, 2026-08-23): the mode-independent farm-business layer (`_farmBusinessModifiers`) now applies feed-field bonuses and penalties plus the mycotoxin penalty after either score path (Standard or Ritter/RL), and F106 makes `undesignateFeedField` dirty-mark symmetric with `designateFeedField`. 439 suite assertions green. On `feat/DC-11-feed-business-layer`, PR opening.
 - [x] Esc framework table freeze (Dairy guest, #30): shared grid restated per show; 1.0.5.4.
 - [~] In-game: Dairy table keeps its columns after visiting another Esc guest in the same session.
@@ -74,12 +80,11 @@
       (`DairyCore_FeedContamination`) routes a harvest cut of a designated feed
       field into `applyFeedContaminationPenalty`; clean cuts never route. The
       designation surface is still callerless, so the adapter is latent today.
-- [ ] **The DC-11 feed-field designation surface ships callerless** (designed
-      state); now that the F105 contamination reader has wired to it (2026-08-21),
-      the placement ruling is owed: the feed-field bonuses and the mycotoxin
-      penalty currently sit inside the Standard score path (`_herdScoreStandard`),
-      so a Ritter farm misses them. Latent today, zero callers; fix the placement
-      before the first designation lands.
+- [x] **The DC-11 feed-field designation surface is BUILT (2026-08-23).** Deep
+      engine dialog from the Dairy Esc glance, backed by `getOwnedFeedFields` and
+      `getBarnDesignations`; Toggle calls designate/undesignate. The feed-field
+      bonuses and the mycotoxin penalty now have real fields to read; this was the
+      last DC-15 predecessor and the herd score can now move.
 - [ ] **`undesignateFeedField` does not mark the barn dirty** while
       `designateFeedField` does, five lines apart. Two-minute fix when someone is
       in that file.
