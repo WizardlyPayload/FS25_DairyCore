@@ -15,6 +15,10 @@ the repo's git history and README.
 
 ### Added
 - Changelog file established (suite ruling 2026-08-22).
+- Feed-field designation surface (DC-11): a deep dialog opened from the Dairy Esc
+  glance ("Feed Fields") lists your owned fields with live soil state and lets you
+  toggle each as feed for a barn. This is what makes the feed bonuses and the
+  mycotoxin penalty actually fire.
 
 ### Fixed
 - Feed-field bonuses and penalties plus the mycotoxin penalty now apply in both
