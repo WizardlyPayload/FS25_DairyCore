@@ -150,6 +150,22 @@ function FeedProvenance:organicFeedFraction(farmId)
     return wsum / wtotal
 end
 
+--- D1: amount-weighted mean contaminated fraction across a farm's feed fills.
+--- The read a barn's trough-exposure consumer uses for ongoing mycotoxin.
+function FeedProvenance:contaminatedFeedFraction(farmId)
+    local byFt = self.provenance[farmId]
+    if byFt == nil then return 0 end
+    local acc = self.accum[farmId]
+    local wsum, wtotal = 0, 0
+    for ft, p in pairs(byFt) do
+        local w = (acc and acc[ft]) or 0
+        wsum = wsum + (p.contaminated or 0) * w
+        wtotal = wtotal + w
+    end
+    if wtotal <= 0 then return 0 end
+    return wsum / wtotal
+end
+
 --- THRESHOLD classification (the ratified organic default): a farm's feed classifies
 --- organic only ABOVE the threshold share of its organic fraction. Strictness rides
 --- the Livestock dial once the spine exists; the neutral value is the ratified default.

@@ -503,10 +503,7 @@ function DairyCoreManager:updateAllBarns(currentDay)
     for _, barn in pairs(self.barns) do
         self:_updateBarnHealth(barn)
         self:_decayMycotoxin(barn)
-        -- DC-8: spoilage no longer lives on the day tick. It evaluates once per
-        -- in-game hour on the hour tick, where the fractional elapsed-time read
-        -- has the hours it needs. The day tick keeps herd health and the mycotoxin
-        -- countdown, and nothing here competes with the hour tick.
+        self:_applyTroughExposure(barn)
     end
 end
 
@@ -1180,6 +1177,28 @@ function DairyCoreManager:_decayMycotoxin(barn)
         end
     end
     self:_refreshFeedDiseaseFlag(barn)
+end
+
+-- D1: trough exposure. Each day, the barn's cattle eat from the farm's stored
+-- feed pool. FeedProvenance tracks the contaminated fraction per fill type;
+-- the amount-weighted mean drives an ongoing mycotoxin exposure. This is the
+-- POOL path (ongoing, proportional to stored contamination). The direct
+-- harvest path (_applyHarvestContamination) is the ACUTE path (immediate
+-- penalty from a diseased cut on a designated field). They coexist: a farmer
+-- who harvests a diseased field gets an acute hit AND the pool rises, which
+-- feeds ongoing exposure until dilution + decay clear it.
+function DairyCoreManager:_applyTroughExposure(barn)
+    local fp = self.feedProvenance
+    if fp == nil or barn.farmId == nil then return end
+    local contFrac = fp:contaminatedFeedFraction(barn.farmId)
+    if contFrac <= 0.01 then return end
+    local myc = DairyConstants.MYCOTOXIN
+    local severity = math.floor(contFrac * 100 + 0.5)
+    local penalty = myc.MIN_PENALTY + math.floor((severity / 100) * (myc.MAX_PENALTY - myc.MIN_PENALTY))
+    if penalty > (barn.mycotoxinPenalty or 0) then
+        barn.mycotoxinPenalty = penalty
+        barn.mycotoxinDaysLeft = math.max(barn.mycotoxinDaysLeft or 0, 1)
+    end
 end
 
 -- =========================================================
