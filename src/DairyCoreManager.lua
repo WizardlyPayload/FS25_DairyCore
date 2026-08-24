@@ -38,6 +38,8 @@ function DairyCoreManager.new()
     }
     -- FP-1: the feed provenance ledger (authority #5). DairyCore is the sole writer.
     self.feedProvenance = FeedProvenance.new(self)
+    -- DC-25: the milk tank registry.
+    self.milkTankRegistry = MilkTank.new(self)
     return self
 end
 
@@ -874,34 +876,48 @@ function DairyCoreManager:_adminSellMilk(barn, quantity, source, nowHours, monot
         return nil, "server_only"
     end
     local fillType = DairyConstants.CONTRACTS.MILK_FILLTYPE
-    local available = self:_milkLevel(barn, fillType)
-    if available <= 0 then return nil, "no_milk" end
 
-    local requested = quantity or available
-    requested = math.min(requested, available)
-
-    -- Suppress the passive detector while we move the milk, so this sale is counted
-    -- once, by us, with its real source.
-    barn._suppressDetection = true
-    local removed = 0
-    pcall(function()
-        local p = barn._placeable
-        if p ~= nil and p.removeHusbandryFillLevel ~= nil then
-            local ftIndex = 0
-            pcall(function()
-                local ftm = g_fillTypeManager
-                if ftm ~= nil then ftIndex = ftm:getFillTypeIndexByName(fillType) or 0 end
-            end)
-            local remaining = p:removeHusbandryFillLevel(barn.farmId, requested, ftIndex)
-            if type(remaining) == "number" then
-                removed = math.max(0, requested - remaining)
-            else
-                removed = requested
-            end
+    -- DC-25: read tank then barn in one server tick.
+    local tankRemoved = 0
+    if self.milkTankRegistry ~= nil then
+        local tank = self.milkTankRegistry:getNearestTankForBarn(barn)
+        if tank ~= nil and tank.fillLevel > 0 then
+            local want = quantity or tank.fillLevel
+            tankRemoved = self.milkTankRegistry:removeMilk(tank.tankId, want)
         end
-    end)
+    end
+
+    local barnAvailable = self:_milkLevel(barn, fillType)
+    local totalAvailable = barnAvailable + tankRemoved
+    if totalAvailable <= 0 then return nil, "no_milk" end
+
+    local requested = quantity or totalAvailable
+    requested = math.min(requested, totalAvailable)
+
+    local barnWant = math.max(0, requested - tankRemoved)
+    barn._suppressDetection = true
+    local barnRemoved = 0
+    if barnWant > 0 then
+        pcall(function()
+            local p = barn._placeable
+            if p ~= nil and p.removeHusbandryFillLevel ~= nil then
+                local ftIndex = 0
+                pcall(function()
+                    local ftm = g_fillTypeManager
+                    if ftm ~= nil then ftIndex = ftm:getFillTypeIndexByName(fillType) or 0 end
+                end)
+                local remaining = p:removeHusbandryFillLevel(barn.farmId, barnWant, ftIndex)
+                if type(remaining) == "number" then
+                    barnRemoved = math.max(0, barnWant - remaining)
+                else
+                    barnRemoved = barnWant
+                end
+            end
+        end)
+    end
     barn._suppressDetection = false
 
+    local removed = tankRemoved + barnRemoved
     if removed <= 0 then return nil, "no_milk" end
 
     local spot = self:_milkSpotPrice()
@@ -1371,6 +1387,44 @@ function DairyCoreManager:onAnimalMoved(errorCode)
     -- is stored internally only (FuelCosts is a price oracle, no registration API).
 end
 
+-- =========================================================
+-- DC-25: Milk tank registration API (the pump shape)
+-- =========================================================
+
+function DairyCoreManager:registerMilkTank(placeable)
+    if self.milkTankRegistry ~= nil then
+        self.milkTankRegistry:registerTank(placeable)
+        self:_markBarnsDirty()
+    end
+end
+
+function DairyCoreManager:deregisterMilkTank(placeable)
+    if self.milkTankRegistry ~= nil then
+        self.milkTankRegistry:deregisterTank(placeable)
+        self:_markBarnsDirty()
+    end
+end
+
+function DairyCoreManager:getMilkTankRows(farmId)
+    if self.milkTankRegistry ~= nil then
+        return self.milkTankRegistry:getTankRows(farmId)
+    end
+    return {}
+end
+
+-- DC-25: total available milk for a barn = tank fill + barn storage.
+function DairyCoreManager:totalMilkAvailable(barn)
+    local barnLevel = self:_milkLevel(barn, DairyConstants.CONTRACTS.MILK_FILLTYPE)
+    local tankLevel = 0
+    if self.milkTankRegistry ~= nil then
+        local tank = self.milkTankRegistry:getNearestTankForBarn(barn)
+        if tank ~= nil then
+            tankLevel = tank.fillLevel or 0
+        end
+    end
+    return barnLevel + tankLevel
+end
+
 -- DC-21 3.2 + DC-9 rota: the admin-gated network actions. The office sale wrapper and
 -- the rota assignment both validate the caller through NetworkSync's default
 -- adminOnly=true, then call the mechanism. The rota's hourly run bypasses these
@@ -1504,6 +1558,11 @@ function DairyCoreManager:_bindBedrock()
         ledger:registerModule(DairyConstants.FEED_PROVENANCE.LEDGER, {
             serialize   = function() return self.feedProvenance:serialize() end,
             deserialize = function(data) self.feedProvenance:deserialize(data) end,
+        })
+        -- DC-25: milk tank fill levels.
+        ledger:registerModule(DairyConstants.MILK_TANK.LEDGER, {
+            serialize   = function() return self.milkTankRegistry:serialize() end,
+            deserialize = function(data) self.milkTankRegistry:deserialize(data) end,
         })
         bound = true
     end

@@ -298,6 +298,15 @@ DairyConstants.ACTIONS = {
     UNASSIGN_ROTA = "DairyCore_UnassignRota",  -- DC-9 rota release (args: barnId)
 }
 
+-- DC-25: milk tank placeable. A mod-owned storage within reach of a barn.
+DairyConstants.MILK_TANK = {
+    TANK_RADIUS = 150,
+    DEFAULT_CAPACITY = 10000,
+    LEDGER = "DairyCore_MilkTanks",
+    NETWORK_CHANNEL = "DairyCore_MilkTanks",
+    CONFIRM_KEY = "dc_milkTank_deleteConfirm",
+}
+
 -- Time Guard accrual priorities (lower settles first). Money-moving before reads.
 DairyConstants.SETTLE_PRIORITY = {
     CONTRACT = 20,

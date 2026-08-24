@@ -24,6 +24,7 @@ source(modDirectory .. "src/Logger.lua")
 source(modDirectory .. "src/DairyConstants.lua")
 source(modDirectory .. "src/RLBridge.lua")
 source(modDirectory .. "src/FeedProvenance.lua")
+source(modDirectory .. "src/MilkTank.lua")
 source(modDirectory .. "src/DairyCoreManager.lua")
 
 -- Esc RF PDA framework joiner (NO-HOST).
