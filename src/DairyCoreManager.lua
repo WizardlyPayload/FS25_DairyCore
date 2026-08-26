@@ -1473,6 +1473,23 @@ function DairyCoreManager:_bindActions()
             self:unassignCollectionWorker(args.barnId)
         end,
     })
+    -- D1: the feed flush is a FARM action (a farm flushes its own feed), not an
+    -- admin tool, so it overrides adminOnly=false and ownership-checks the caller
+    -- like the C2 disease flush: without it a client could send another farm's id
+    -- and spend that farm's money.
+    ns:registerAction(DairyConstants.FEED_FLUSH.ACTION, {
+        adminOnly = false,
+        onAction = function(userId, args)
+            if type(args) ~= "table" or args.farmId == nil then return end
+            local farm = g_farmManager ~= nil and g_farmManager:getFarmByUserId(userId) or nil
+            if farm == nil or farm.farmId ~= args.farmId then
+                DCLogger.warning("FEED_FLUSH rejected: userId %s is not a member of farm %s",
+                    tostring(userId), tostring(args.farmId))
+                return
+            end
+            self:_doFeedFlush(args.farmId)
+        end,
+    })
     self.actionsBound = true
 end
 
@@ -2318,4 +2335,193 @@ end
 function DairyCoreManager:consoleFeedProvenance()
     if self.feedProvenance == nil then return "feed provenance not initialised" end
     return self.feedProvenance:consoleDump()
+end
+
+-- =========================================================
+-- D1: the paid contaminated-feed recovery flush (the C5 hatch)
+-- =========================================================
+-- Pay to purge a farm's contaminated feed pool at the locked C5 per-litre rate
+-- (DairyConstants.FEED_FLUSH.RATE_PER_LITRE, the mid of the governed 0.05-0.10
+-- band) scaled by the Economy recovery-hatch curve. The passive daily decay
+-- (FeedProvenance:decayContaminated) stays the free never-stuck floor; this is
+-- the fast-out. Server-authoritative; a client routes through the NetworkSync
+-- action. Mirrors the C2 disease-flush shape (ProStaffDiseaseFlush.lua).
+
+--- Resolve a farm id for a D1 action: the given id when real, else this machine's
+--- own farm. Nil when neither resolves (a dedicated server with no caller farm).
+---@param farmId number|nil
+---@return number|nil
+function DairyCoreManager:_resolveFarmId(farmId)
+    if self:_isRealFarmId(farmId) then return farmId end
+    local localId = nil
+    pcall(function()
+        if g_currentMission ~= nil and g_currentMission.getFarmId ~= nil then
+            localId = g_currentMission:getFarmId()
+        end
+    end)
+    if self:_isRealFarmId(localId) then return localId end
+    return nil
+end
+
+--- The C5 recovery-hatch multiplier off the Economy dial. Resolved through the
+--- spine resolver when one is reachable (the mission bridge, then the global);
+--- NEUTRAL 1.0 when absent, when the dial is switched off, or when the resolve
+--- throws - the same neutral-until-spine contract the rest of DairyCore's economy
+--- carries today.
+---@return number multiplier
+function DairyCoreManager:_economyHatchMultiplier()
+    local resolver = nil
+    pcall(function()
+        resolver = (g_currentMission and g_currentMission.optionScalingResolver)
+            or (getfenv and getfenv(0) and getfenv(0).g_OptionScalingResolver)
+    end)
+    if type(resolver) ~= "table" or type(resolver.readProfile) ~= "function"
+       or type(resolver.resolve) ~= "function" then return 1.0 end
+    local hub = (g_currentMission and g_currentMission.settingsHub) or g_settingsHub
+    local ok, profile = pcall(resolver.readProfile, hub)
+    if not ok or profile == nil then return 1.0 end
+    local ok2, mult = pcall(resolver.resolve, {
+        dial = "economy",
+        base = 1.0,
+        neutral = 1.0,
+        curve = DairyConstants.FEED_FLUSH.ECONOMY_HATCH_CURVE,
+    }, profile)
+    if not ok2 or type(mult) ~= "number" or mult < 0 then return 1.0 end
+    return mult
+end
+
+--- Read-only quote for the feed flush: the contaminated fills, the per-fill C5
+--- fee, the total, and the Economy multiplier used. Safe for console and a future
+--- player surface.
+---@param farmId number|nil
+---@return table quote { fills, totalCost, economyMultiplier }
+function DairyCoreManager:feedFlushQuote(farmId)
+    farmId = self:_resolveFarmId(farmId)
+    if farmId == nil then return { fills = {}, totalCost = 0, economyMultiplier = 1.0 } end
+    local fills = (self.feedProvenance and self.feedProvenance:contaminatedFills(farmId)) or {}
+    local mult = self:_economyHatchMultiplier()
+    local total = 0
+    for _, f in ipairs(fills) do
+        f.cost = math.floor(math.max(0, f.contaminatedLitres * DairyConstants.FEED_FLUSH.RATE_PER_LITRE * mult))
+        total = total + f.cost
+    end
+    return { fills = fills, totalCost = total, economyMultiplier = mult }
+end
+
+--- Client-to-server / server-direct request to run the feed flush for a farm.
+--- A client routes through the NetworkSync action; the server applies directly.
+---@param farmId number|nil
+---@return boolean ok, string reason
+function DairyCoreManager:requestFeedFlush(farmId)
+    farmId = self:_resolveFarmId(farmId)
+    if farmId == nil then return false, "farm" end
+    if self:_isServer() then return self:_doFeedFlush(farmId) end
+    local ns = self:_getNetworkSync()
+    if ns ~= nil and ns.requestAction ~= nil then
+        ns:requestAction(DairyConstants.FEED_FLUSH.ACTION, { farmId = farmId })
+        return true, "requested"
+    end
+    DCLogger.warning("requestFeedFlush: no server authority and NetworkSync absent - cannot flush on a pure client")
+    return false, "no_network"
+end
+
+--- Server-side feed flush: guard, price, fund-check, book the C5 fee, then purge.
+---@param farmId number
+---@return boolean ok, string reason
+function DairyCoreManager:_doFeedFlush(farmId)
+    if not self:_isServer() then return false, "server_only" end
+    if self.feedFlushGuard and self.feedFlushGuard[farmId] then
+        DCLogger.info("Feed flush skipped for farm %d: a flush is already running", farmId)
+        return false, "busy"
+    end
+    self.feedFlushGuard = self.feedFlushGuard or {}
+    self.feedFlushGuard[farmId] = true
+    local results = { pcall(function() return self:_feedFlushLocked(farmId) end) }
+    self.feedFlushGuard[farmId] = nil
+    if not results[1] then
+        DCLogger.warning("Feed flush failed for farm %d: %s", farmId, tostring(results[2]))
+        return false, "error"
+    end
+    return results[2], results[3]
+end
+
+--- The actual flush work, run with the per-farm guard held.
+function DairyCoreManager:_feedFlushLocked(farmId)
+    local fills = (self.feedProvenance and self.feedProvenance:contaminatedFills(farmId)) or {}
+    if #fills == 0 then return false, "none" end
+    local mult = self:_economyHatchMultiplier()
+    local total = 0
+    for _, f in ipairs(fills) do
+        total = total + math.floor(math.max(0, f.contaminatedLitres * DairyConstants.FEED_FLUSH.RATE_PER_LITRE * mult))
+    end
+    if not self:_farmHasFunds(farmId, total) then
+        DCLogger.info("Feed flush denied for farm %d: C5 fee %d exceeds balance", farmId, total)
+        return false, "funds"
+    end
+    if total > 0 then
+        self:_bookFeedFlushFee(farmId, total)
+    end
+    local purged = self.feedProvenance:purgeContamination(farmId)
+    DCLogger.info("Farm %d feed flush: %d fill type(s) purged, C5 fee %d (mult %.2f)",
+        farmId, purged, total, mult)
+    return true, "done"
+end
+
+--- Balance check for the flush fee. A flush that cannot be afforded is denied
+--- whole, never partially.
+---@param farmId number
+---@param cost number
+---@return boolean
+function DairyCoreManager:_farmHasFunds(farmId, cost)
+    if cost <= 0 then return true end
+    local balance = 0
+    pcall(function()
+        local farm = g_farmManager ~= nil and g_farmManager:getFarmById(farmId) or nil
+        if farm ~= nil then
+            if farm.getBalance ~= nil then
+                balance = farm:getBalance()
+            else
+                balance = farm.money or 0
+            end
+        end
+    end)
+    return balance >= cost
+end
+
+--- Book the C5 fee: a server-authoritative debit (MoneyType.OTHER, the same type
+--- as DairyCore's income lines), audited through TaxMod.
+---@param farmId number
+---@param cost number
+function DairyCoreManager:_bookFeedFlushFee(farmId, cost)
+    pcall(function()
+        g_currentMission:addMoney(-cost, farmId, MoneyType.OTHER, true, true)
+    end)
+    self:_taxAudit(farmId, -cost, DairyConstants.FEED_FLUSH.LABEL)
+end
+
+-- Console (server-only reads/actions; a client gets the request-routed message).
+function DairyCoreManager:consoleFeedFlushQuote()
+    local farmId = self:_resolveFarmId(nil)
+    if farmId == nil then return "no farm resolved" end
+    local q = self:feedFlushQuote(farmId)
+    local lines = { string.format(
+        "Feed flush (farm %d): economyMult=%.2f, fills=%d, total=%d",
+        farmId, q.economyMultiplier, #q.fills, q.totalCost) }
+    for _, f in ipairs(q.fills) do
+        lines[#lines + 1] = string.format("  %s: cont=%.3f, litres=%.0f, contaminated litres=%.0f (%d)",
+            tostring(f.fillType), f.contaminated, f.litres, f.contaminatedLitres, f.cost)
+    end
+    return table.concat(lines, "\n")
+end
+
+function DairyCoreManager:consoleFeedFlush()
+    local farmId = self:_resolveFarmId(nil)
+    if farmId == nil then return "no farm resolved" end
+    local ok, reason = self:requestFeedFlush(farmId)
+    if self:_isServer() then
+        if ok then return string.format("Farm %d feed flushed.", farmId) end
+        return string.format("Feed flush failed: %s.", tostring(reason))
+    end
+    return ok and "Feed flush requested from the server."
+        or ("Feed flush request failed: " .. tostring(reason))
 end

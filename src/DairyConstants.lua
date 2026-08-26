@@ -230,6 +230,19 @@ DairyConstants.FEED_PROVENANCE = {
     ORGANIC_THRESHOLD = 0.8,
 }
 
+-- D1: the paid contaminated-feed recovery flush (the C5 recovery hatch).
+-- RATE_PER_LITRE is the per-litre purge rate, the mid of the LOCKED C5 band
+-- (0.05-0.10 at Standard; see systems/escape-hatch-pricing). The cost scales by
+-- the Economy recovery-hatch curve (0.2 / 1.0 / 2.75, neutral 1.0 when the spine
+-- is absent). The passive daily decay stays the free never-stuck floor; paying
+-- only buys speed.
+DairyConstants.FEED_FLUSH = {
+    RATE_PER_LITRE      = 0.08,
+    ECONOMY_HATCH_CURVE = { 0.2, 1.0, 2.75 },
+    LABEL               = "Contaminated-Feed Flush",
+    ACTION              = "DairyCore_FeedFlush",
+}
+
 -- ProStaff ladder multipliers DairyCore reads (all neutral 1.0 when absent).
 DairyConstants.PROSTAFF = {
     L3_LOGISTICS = 1.05,
