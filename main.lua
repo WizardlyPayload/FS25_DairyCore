@@ -93,6 +93,10 @@ if addConsoleCommand ~= nil then
         "consoleCollectionTick", dairyCore)
     addConsoleCommand("dcFeedProvenance", "FP-1: show the farm feed provenance ledger (server only)",
         "consoleFeedProvenance", dairyCore)
+    addConsoleCommand("dcFeedFlushQuote", "D1: quote the contaminated-feed flush for the local farm",
+        "consoleFeedFlushQuote", dairyCore)
+    addConsoleCommand("dcFeedFlush", "D1: pay to purge the farm's contaminated feed (server only)",
+        "consoleFeedFlush", dairyCore)
 end
 
 
