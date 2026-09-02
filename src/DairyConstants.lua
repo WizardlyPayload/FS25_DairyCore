@@ -320,6 +320,43 @@ DairyConstants.MILK_TANK = {
     CONFIRM_KEY = "dc_milkTank_deleteConfirm",
 }
 
+-- DC-27: herd breed composition and milk provenance (records only, no score,
+-- premium or price). Identifiers for the ledger module, the NetworkSync module
+-- and channel, the wire schema token, and the persisted row versions. The
+-- REASON tokens are the stable unavailable-reasons a surface may translate.
+DairyConstants.BREED_SURFACE = {
+    LEDGER          = "DairyCore_MilkBreed",
+    NETWORK_MODULE  = "DairyCore_BreedSurface",
+    NETWORK_CHANNEL = "DairyCore_BreedSurface",
+    SCHEMA          = "DC27_BREED_SURFACE/v1",
+    PERSIST_VERSION = 1,
+    ROW_VERSION     = 1,           -- getBarnRows().breedSurfaceVersion
+    -- Milk fill types the record tracks. Anything else in a barn's own tank is
+    -- outside the contract (no DC-25 tanks, no other fill types).
+    MILK_FILLTYPES  = { "MILK", "BUFFALOMILK" },
+    -- Fallback mirror cadence (ms) when NetworkSync is absent; the direct event
+    -- only carries a snapshot that often.
+    FALLBACK_DIRTY_MS = 1000,
+    -- Which herd model produced the counts.
+    SOURCE_STANDARD = "STANDARD",
+    SOURCE_RL       = "REALISTIC_LIVESTOCK",
+    REASON = {
+        WAITING_FOR_SERVER       = "WAITING_FOR_SERVER",
+        UNRESOLVED_FILLTYPE      = "UNRESOLVED_FILLTYPE",
+        NO_INTERNAL_STORAGE      = "NO_INTERNAL_STORAGE",
+        NON_SINGLE_STORAGE_ROUTE = "NON_SINGLE_STORAGE_ROUTE",
+        HERD_UNRESOLVED          = "HERD_UNRESOLVED",
+    },
+    -- A cluster whose sub type carries milk output but no readable name.
+    UNKNOWN_SUBTYPE = "UNKNOWN",
+    -- Wire sentinel for "no farm id on this row".
+    NONE_FARM       = 0,
+    -- Mirror validation: |unknown + sum(known) - litres| must stay within
+    -- CONSERVATION_ABS + litres * CONSERVATION_REL after float32 transport.
+    CONSERVATION_ABS = 0.01,
+    CONSERVATION_REL = 0.0001,
+}
+
 -- Time Guard accrual priorities (lower settles first). Money-moving before reads.
 DairyConstants.SETTLE_PRIORITY = {
     CONTRACT = 20,

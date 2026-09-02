@@ -1914,12 +1914,12 @@ function RfPdaMenuPage:_syncHostGuestChrome(activeId)
         -- duplicate bottom-bar buttons go, since the cards now carry that content.
         self.menuButtonInfo = { self.btnBack, self.btnHelp }
     elseif isDairy then
-        -- DC-11: the Feed Fields designation dialog opens from the Dairy footer.
-        self.menuButtonInfo = { self.btnBack, self.btnFeedFields }
-        local trFn = self._rfTr
-        if type(trFn) == "function" and self.btnFeedFields ~= nil then
-            self.btnFeedFields.text = trFn("dc_rf_pda_btn_feed_fields", "Feed Fields")
-        end
+        -- BUILD 06:59 (George CLOSED DESIGN 06:50): Dairy is Back only. Feed Fields was
+        -- the wrong story (soil N/P/K is not feed quality); the cards carry the farm's
+        -- stored-feed readout now. btnFeedFields stays constructed so stale bindings
+        -- resolve, never assigned (same rule as btnCsConsultant). The other eight door
+        -- copies never had this branch and already fall through to Back only.
+        self.menuButtonInfo = { self.btnBack }
     else
         self.menuButtonInfo = { self.btnBack }
     end
