@@ -202,6 +202,34 @@ function FeedDesignationDialog:_rebuildFields()
     if self._fieldIndex < 1 or self._fieldIndex > #self._fields then self._fieldIndex = 1 end
 end
 
+--- BUILD 23:43: the barn row shows the human barn name, never the raw uniqueId.
+--- DairyRfPdaGuest.barnLabel is the one name ladder for the mod (it loads before this
+--- file in main.lua); the placeable walk below is the fallback for a standalone load.
+local function humanBarnLabel(barnId)
+    if DairyRfPdaGuest ~= nil and type(DairyRfPdaGuest.barnLabel) == "function" then
+        local ok, name = pcall(DairyRfPdaGuest.barnLabel, { barnId = barnId })
+        if ok and type(name) == "string" and name ~= "" then return name end
+    end
+    if g_currentMission ~= nil and g_currentMission.placeableSystem ~= nil then
+        local ps = g_currentMission.placeableSystem
+        if type(ps.getPlaceableByUniqueId) == "function" then
+            local ok, placeable = pcall(function() return ps:getPlaceableByUniqueId(barnId) end)
+            if ok and placeable ~= nil then
+                if type(placeable.getName) == "function" then
+                    local ok2, n = pcall(function() return placeable:getName() end)
+                    if ok2 and type(n) == "string" and n ~= "" then return n end
+                end
+                if type(placeable.nameCustom) == "string" and placeable.nameCustom ~= "" then
+                    return placeable.nameCustom
+                end
+            end
+        end
+    end
+    local id = tostring(barnId or "?")
+    if #id > 24 then return id:sub(1, 22) .. "..." end
+    return id
+end
+
 local function npkLine(info)
     local function st(v)
         if v == nil then return "--" end
@@ -225,7 +253,7 @@ function FeedDesignationDialog:_refresh()
     end
     local barnId = self._barns[self._barnIndex]
     if self.fdBarnLabel then
-        self.fdBarnLabel:setText(barnId ~= nil and tostring(barnId) or tr("dc_fd_no_barns", "no barns"))
+        self.fdBarnLabel:setText(barnId ~= nil and humanBarnLabel(barnId) or tr("dc_fd_no_barns", "no barns"))
     end
 
     local field = self._fields[self._fieldIndex]

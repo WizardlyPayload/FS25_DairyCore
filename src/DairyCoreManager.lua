@@ -40,6 +40,16 @@ function DairyCoreManager.new()
     self.feedProvenance = FeedProvenance.new(self)
     -- DC-25: the milk tank registry.
     self.milkTankRegistry = MilkTank.new(self)
+    -- DC-27: the milk breed book (server) and the client mirror.
+    self.milkBreed = {}                    -- barnId -> fillTypeName -> { litres, fractions }
+    self.breedSurfaceMirror = nil          -- client: last validated snapshot
+    self.breedSurfaceMirrorReady = false
+    self.breedSurfaceMirrorError = nil
+    self._breedSurfaceNsRegistered = false
+    self._breedSurfaceDirty = false
+    self._breedSurfaceAccum = 0
+    self._milkBreedContext = nil           -- open production context (server)
+    self._milkBreedMessagesBound = false
     return self
 end
 
@@ -69,6 +79,9 @@ function DairyCoreManager:onMissionLoaded()
     -- FP-1: subscribe to SF's soilHarvestBus on the server so grain harvests seed
     -- the farm's feed provenance. Delegate-when-present and read-only.
     self:_bindHarvestBus()
+    -- DC-27: storage/herd change messages and the hook verify line.
+    self:_bindMilkBreedMessages()
+    self:_logMilkBreedVerify()
 
     -- Trailer-transfer completion (Ritter mode, Integration 29C): base-game event.
     pcall(function()
@@ -83,6 +96,7 @@ function DairyCoreManager:onMissionLoaded()
 end
 
 function DairyCoreManager:onMissionDelete()
+    self:_teardownMilkBreed()
     if self.animalMoveBound and g_messageCenter ~= nil then
         pcall(function() g_messageCenter:unsubscribeAll(self) end)
     end
@@ -95,6 +109,7 @@ function DairyCoreManager:update(dt)
     if not self.bedrockBound then self:_bindBedrock() end
     if not self.clockBound then self:_subscribeClock() end
     self:_retryDiscovery(dt)
+    self:_updateBreedSurfaceFallback(dt)
 end
 
 -- DC-32: on a dedicated server and on a client join, onMissionLoaded can fire before the
@@ -250,6 +265,8 @@ function DairyCoreManager:discoverBarns()
     self:_reconcileBarns()
     for _, barn in pairs(self.barns) do
         self:_attachStorageListeners(barn)
+        -- DC-27: the internal Storage listener and the record refresh.
+        self:_refreshMilkBreedBarn(barn)
     end
 end
 
@@ -965,6 +982,7 @@ function DairyCoreManager:_reconcileBarns()
             -- it yet); only drop records we can prove dead.
             if barn._probeDead then
                 self:_detachStorageListeners(barn)
+                self:_forgetMilkBreedBarn(barn, barnId)
                 self.barns[barnId] = nil
             else
                 barn._probeDead = true
@@ -1600,6 +1618,11 @@ function DairyCoreManager:_bindBedrock()
             serialize   = function() return self.milkTankRegistry:serialize() end,
             deserialize = function(data) self.milkTankRegistry:deserialize(data) end,
         })
+        -- DC-27: milk provenance records (litres and breed shares per barn and fill type).
+        ledger:registerModule(DairyConstants.BREED_SURFACE.LEDGER, {
+            serialize   = function() return self:_serializeMilkBreed() end,
+            deserialize = function(data) self:_deserializeMilkBreed(data) end,
+        })
         bound = true
     end
 
@@ -1610,6 +1633,22 @@ function DairyCoreManager:_bindBedrock()
             onWriteState = function() return self:_onWriteBarnState() end,
             onReadState  = function(arr) self:_onReadBarnState(arr) end,
         })
+        -- DC-27: the breed surface mirror. A rejected snapshot raises so NetworkSync
+        -- counts it unapplied; the client keeps waiting rather than reading a lie.
+        local cfgBS = DairyConstants.BREED_SURFACE
+        local okReg = ns:registerModule(cfgBS.NETWORK_MODULE, {
+            channel      = cfgBS.NETWORK_CHANNEL,
+            onWriteState = function() return self:_onWriteBreedSurfaceState() end,
+            onReadState  = function(arr)
+                if not self:_applyBreedSurfaceSnapshot(arr, "NETWORKSYNC") then
+                    error("DC-27 breed surface snapshot rejected: " .. tostring(self.breedSurfaceMirrorError), 0)
+                end
+            end,
+        })
+        self._breedSurfaceNsRegistered = okReg == true
+        DCLogger.info("[DC27 SYNC] transport=%s action=REGISTER schema=%s barns=0 reason=%s",
+            self._breedSurfaceNsRegistered and "NETWORKSYNC" or "DIRECT_EVENT", cfgBS.SCHEMA,
+            self._breedSurfaceNsRegistered and "OK" or "REGISTER_FAILED")
         bound = true
     end
 
@@ -1999,6 +2038,9 @@ function DairyCoreManager:_saveOwnFile()
         end
     end
 
+    -- DC-27: provenance rows (read back as unknown milk).
+    self:_writeMilkBreedOwnFile(xml)
+
     xml:save()
     xml:delete()
 end
@@ -2115,6 +2157,9 @@ function DairyCoreManager:_loadOwnFile()
         end)
     end
 
+    -- DC-27: provenance rows come back as unknown milk (RESET_UNKNOWN).
+    self:_readMilkBreedOwnFile(xml)
+
     xml:delete()
 end
 
@@ -2150,6 +2195,14 @@ function DairyCoreManager:_rowTrust(b)
     t.barnId = DairyConstants.TRUST.SERVER
     t.ritterMode = DairyConstants.TRUST.SERVER
     t.farmId = server and DairyConstants.TRUST.SERVER or DairyConstants.TRUST.LOCAL
+    -- DC-27: the version is a constant; the farm id and both breed members are
+    -- server truth on the server and on a client holding a validated mirror,
+    -- unknown (waiting) on a client without one.
+    local mirrored = server or self:_mirrorEntry(b.barnId) ~= nil
+    t.breedSurfaceVersion = DairyConstants.TRUST.SERVER
+    t.breedSurfaceFarmId = mirrored and DairyConstants.TRUST.SERVER or DairyConstants.TRUST.UNKNOWN
+    t.herdBreedComposition = t.breedSurfaceFarmId
+    t.milkBreedProvenance = t.breedSurfaceFarmId
     return t
 end
 
@@ -2191,6 +2244,9 @@ function DairyCoreManager:getBarnRows()
                     and b.lastCollectionLitres[DairyConstants.CONTRACTS.MILK_FILLTYPE] or nil }
             -- DC-14 3a: every field declares where it came from.
             row.trust = self:_rowTrust(b)
+            -- DC-27 version 1: breedSurfaceVersion, breedSurfaceFarmId,
+            -- herdBreedComposition, milkBreedProvenance.
+            self:_applyBreedSurfaceRow(row, b)
             if b.ritterMode then
                 local counts = RLBridge:getHerdCounts(barnId, b.farmId)
                 if counts ~= nil then row.counts = counts end
@@ -2524,4 +2580,1226 @@ function DairyCoreManager:consoleFeedFlush()
     end
     return ok and "Feed flush requested from the server."
         or ("Feed flush request failed: " .. tostring(reason))
+end
+
+-- =========================================================
+-- DC-27: herd breed composition and milk provenance (records only)
+-- =========================================================
+-- Which milking breeds stand in a barn now, and which breeds produced the milk
+-- still in that barn's own tank. Server-authoritative; a pure client reads a
+-- validated mirror and says WAITING_FOR_SERVER until one has arrived. Unknown
+-- milk stays unknown: only litres deposited by the base milk production call,
+-- observed inside the DC-27 wrapper around PlaceableHusbandryMilk.updateOutput,
+-- are attributed to breeds (the herd's per-breed litres-per-hour shares at that
+-- moment). Every other rise in the tank (a milking robot, another mod, a
+-- transfer) is unknown milk; a fall keeps the tank's proportions, one tank being
+-- one mix. A barn whose milk can reach more than one Storage, or that has no
+-- internal Storage, is not tracked: the record drops and the getter says why.
+-- MILK and BUFFALOMILK only. No DC-25 tanks. No score, premium or price.
+
+local MB_EPS = 0.001
+
+local function mbCfg()
+    return DairyConstants.BREED_SURFACE
+end
+
+-- Trace line on the dev-warning channel plus the DairyCore debug channel.
+-- Never a user-facing print.
+local function mbLog(fmt, ...)
+    local line = string.format(fmt, ...)
+    if Logging ~= nil and Logging.devInfo ~= nil then
+        pcall(Logging.devInfo, "%s", DCLogger.PREFIX .. line)
+    end
+    DCLogger.debug("%s", line)
+end
+
+local function mbIsFinite(v)
+    return type(v) == "number" and v == v and v ~= math.huge and v ~= -math.huge
+end
+
+local function mbFillTypeIndex(name)
+    if type(name) ~= "string" or g_fillTypeManager == nil then return nil end
+    local ok, index = pcall(function() return g_fillTypeManager:getFillTypeIndexByName(name) end)
+    if ok and type(index) == "number" then return index end
+    return nil
+end
+
+local function mbFillTypeName(index)
+    if type(index) ~= "number" or g_fillTypeManager == nil then return nil end
+    local ok, name = pcall(function() return g_fillTypeManager:getFillTypeNameByIndex(index) end)
+    if ok and type(name) == "string" then return name end
+    return nil
+end
+
+local function mbIsTrackedMilk(name)
+    for _, tracked in ipairs(mbCfg().MILK_FILLTYPES) do
+        if tracked == name then return true end
+    end
+    return false
+end
+
+-- Raw Storage level for one fill type; nil when it cannot be read (never zero).
+local function mbLevel(storage, ftIndex)
+    local ok, level = pcall(function() return storage:getFillLevel(ftIndex) end)
+    if ok and mbIsFinite(level) then return math.max(0, level) end
+    return nil
+end
+
+local function mbSortedKeys(t)
+    local keys = {}
+    for k in pairs(t or {}) do keys[#keys + 1] = k end
+    table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+    return keys
+end
+
+local function mbCopy(t)
+    local out = {}
+    for k, v in pairs(t or {}) do out[k] = v end
+    return out
+end
+
+-- Drop zero/negative/non-finite shares and clamp the rest to [0, 1].
+local function mbPrune(fractions)
+    local out = {}
+    for name, f in pairs(fractions or {}) do
+        if mbIsFinite(f) and f > MB_EPS then
+            out[name] = math.min(1, f)
+        end
+    end
+    return out
+end
+
+local function mbUnknownShare(fractions)
+    local sum = 0
+    for _, f in pairs(fractions or {}) do sum = sum + f end
+    return math.min(1, math.max(0, 1 - sum))
+end
+
+local function mbWaiting(trust)
+    return { available = false, reason = mbCfg().REASON.WAITING_FOR_SERVER, trust = trust }
+end
+
+local function mbUnavailable(reason)
+    return { available = false, reason = reason, trust = DairyConstants.TRUST.SERVER }
+end
+
+-- Blend `litres` of milk with the given breed shares (nil = unknown milk) into
+-- the record: f' = (S * f + d * fIn) / (S + d).
+local function mbBlend(rec, litres, incoming)
+    local before = rec.litres or 0
+    local total = before + litres
+    if total <= MB_EPS then
+        rec.litres = 0
+        rec.fractions = {}
+        return
+    end
+    local out = {}
+    for name, f in pairs(rec.fractions or {}) do
+        out[name] = (before * f) / total
+    end
+    for name, f in pairs(incoming or {}) do
+        out[name] = (out[name] or 0) + (litres * f) / total
+    end
+    rec.fractions = mbPrune(out)
+    rec.litres = total
+end
+
+-- ---------------------------------------------------------
+-- The production wrapper (class slot, installed at script load)
+-- ---------------------------------------------------------
+-- PlaceableHusbandryMilk.updateOutput is the one base call that deposits milk
+-- from production. Its VALUE is captured into every husbandry placeable type by
+-- TypeManager:finalizeTypes(), which runs after the mod scripts on each mission
+-- load, so replacing the class slot from main.lua puts the DC-27 wrapper into the
+-- chain exactly once per load. Ritter (RealisticLivestock) wraps
+-- updateInputAndOutput and onHusbandryAnimalsUpdate, not this slot, so the same
+-- wrapper serves both herd models. Static state survives a re-source; the
+-- install is guarded on slot identity, so a re-run never stacks and a restored
+-- slot re-installs cleanly. The base call runs exactly once per invocation.
+
+DairyCoreManager._milkBreedWrapState = DairyCoreManager._milkBreedWrapState
+    or { captured = nil, wrapper = nil, installCount = 0 }
+
+function DairyCoreManager._installMilkBreedProductionWrapper()
+    local st = DairyCoreManager._milkBreedWrapState
+    if PlaceableHusbandryMilk == nil or type(PlaceableHusbandryMilk.updateOutput) ~= "function" then
+        return false
+    end
+    if st.wrapper ~= nil and PlaceableHusbandryMilk.updateOutput == st.wrapper then
+        return true
+    end
+    local captured = PlaceableHusbandryMilk.updateOutput
+    local wrapper = function(placeable, superFunc, foodFactor, productionFactor, globalProductionFactor)
+        local mgr = g_dairyCoreManager
+        if mgr == nil and g_currentMission ~= nil then mgr = g_currentMission.dairyCoreManager end
+        if mgr ~= nil and mgr._observeMilkBreedProduction ~= nil then
+            return mgr:_observeMilkBreedProduction(placeable, captured, superFunc,
+                foodFactor, productionFactor, globalProductionFactor)
+        end
+        return captured(placeable, superFunc, foodFactor, productionFactor, globalProductionFactor)
+    end
+    st.captured = captured
+    st.wrapper = wrapper
+    st.installCount = (st.installCount or 0) + 1
+    PlaceableHusbandryMilk.updateOutput = wrapper
+    return true
+end
+
+-- Put the captured function back, only while the class slot is still ours.
+function DairyCoreManager._removeMilkBreedProductionWrapper()
+    local st = DairyCoreManager._milkBreedWrapState
+    if st.wrapper ~= nil and PlaceableHusbandryMilk ~= nil
+        and PlaceableHusbandryMilk.updateOutput == st.wrapper then
+        PlaceableHusbandryMilk.updateOutput = st.captured
+    end
+    st.wrapper = nil
+    st.captured = nil
+end
+
+function DairyCoreManager:_logMilkBreedVerify()
+    local st = DairyCoreManager._milkBreedWrapState or {}
+    local slot = PlaceableHusbandryMilk ~= nil and PlaceableHusbandryMilk.updateOutput or nil
+    local chain = "NONE"
+    if st.wrapper ~= nil and slot == st.wrapper then
+        chain = "DC27>CAPTURED"
+    elseif st.wrapper ~= nil then
+        chain = "FOREIGN>DC27"
+    end
+    DCLogger.info("[DC27 VERIFY] hook=BASE_MILK_CAPTURE installCount=%d chain=%s server=%s transport=%s",
+        st.installCount or 0, chain, tostring(self:_isServer()),
+        self._breedSurfaceNsRegistered and "NETWORKSYNC" or "DIRECT_EVENT")
+end
+
+-- ---------------------------------------------------------
+-- Production observation (server, once per in-game hour per barn)
+-- ---------------------------------------------------------
+
+-- Runs the captured base call exactly once. Around it, when this barn is
+-- tracked, a context records the pre-call level and the herd's production
+-- shares so the deposit can be attributed; anything the base call raises is
+-- re-raised after the context closes. Re-entrancy never opens a second context.
+function DairyCoreManager:_observeMilkBreedProduction(placeable, captured, superFunc,
+        foodFactor, productionFactor, globalProductionFactor)
+    local owned = false
+    if self:_isServer() and not self.disabled and self._milkBreedContext == nil then
+        local ok, ctx = pcall(self._openMilkBreedContext, self, placeable, productionFactor, globalProductionFactor)
+        if ok then
+            if ctx ~= nil then
+                self._milkBreedContext = ctx
+                owned = true
+            end
+        else
+            DCLogger.debug("DC-27: production context open failed: %s", tostring(ctx))
+        end
+    end
+    local ok, err = pcall(captured, placeable, superFunc, foodFactor, productionFactor, globalProductionFactor)
+    if owned then
+        local ctx = self._milkBreedContext
+        self._milkBreedContext = nil
+        local closed, cerr = pcall(self._closeMilkBreedContext, self, ctx)
+        if not closed then
+            DCLogger.debug("DC-27: production context close failed: %s", tostring(cerr))
+        end
+    end
+    if not ok then error(err, 0) end
+end
+
+function DairyCoreManager:_barnForPlaceable(placeable)
+    if placeable == nil then return nil end
+    for _, barn in pairs(self.barns) do
+        if barn._placeable == placeable and not barn._probeDead then return barn end
+    end
+    return nil
+end
+
+function DairyCoreManager:_openMilkBreedContext(placeable, productionFactor, globalProductionFactor)
+    local barn = self:_barnForPlaceable(placeable)
+    local spec = placeable ~= nil and placeable.spec_husbandryMilk or nil
+    if barn == nil or spec == nil or not spec.hasMilkProduction then return nil end
+    local timeAdjustment = 1
+    if g_currentMission ~= nil and g_currentMission.environment ~= nil
+        and mbIsFinite(g_currentMission.environment.timeAdjustment) then
+        timeAdjustment = g_currentMission.environment.timeAdjustment
+    end
+    local ctx = { placeable = placeable, barn = barn, entries = {} }
+    for _, ftIndex in ipairs(spec.fillTypes or {}) do
+        local name = mbFillTypeName(ftIndex)
+        if name ~= nil and mbIsTrackedMilk(name) then
+            local storage, reason, targets, sources = self:_resolveMilkProvenanceStorage(placeable, ftIndex)
+            self:_noteMilkBreedTopology(barn, name, storage ~= nil, targets, sources)
+            local level = storage ~= nil and mbLevel(storage, ftIndex) or nil
+            if storage ~= nil and level ~= nil then
+                -- Settle the record to the pre-call level, so the deposit below is
+                -- the only difference this context can see.
+                self:_reconcileMilkBreed(barn, name, level, nil)
+                local litersPerHour = spec.litersPerHour ~= nil and spec.litersPerHour[ftIndex] or 0
+                local budget = (productionFactor or 0) * (globalProductionFactor or 0)
+                    * (litersPerHour or 0) * timeAdjustment
+                ctx.entries[ftIndex] = {
+                    name = name,
+                    storage = storage,
+                    fractions = self:_deriveMilkProductionShares(placeable, ftIndex),
+                    remainingBudget = mbIsFinite(budget) and math.max(0, budget) or 0,
+                }
+            else
+                self:_invalidateMilkBreed(barn, name, reason or mbCfg().REASON.NO_INTERNAL_STORAGE)
+            end
+        end
+    end
+    if next(ctx.entries) == nil then return nil end
+    return ctx
+end
+
+function DairyCoreManager:_closeMilkBreedContext(ctx)
+    for ftIndex, entry in pairs(ctx.entries) do
+        local storage = self:_resolveMilkProvenanceStorage(ctx.placeable, ftIndex)
+        local level = (storage ~= nil and storage == entry.storage) and mbLevel(storage, ftIndex) or nil
+        if level ~= nil then
+            -- The listener only fires past 0.1 L or an integer crossing; whatever
+            -- it did not book is still this context's deposit, known up to the budget.
+            self:_reconcileMilkBreed(ctx.barn, entry.name, level, entry)
+        else
+            self:_invalidateMilkBreed(ctx.barn, entry.name, mbCfg().REASON.NON_SINGLE_STORAGE_ROUTE)
+        end
+    end
+end
+
+-- ---------------------------------------------------------
+-- Herd reads (both herd models)
+-- ---------------------------------------------------------
+
+-- The herd list and the model it came from. Ritter's cluster system answers
+-- getAnimals() (one animal per entry, read through the bridge so a failure
+-- degrades the bridge as every other Ritter read does); Standard answers
+-- placeable:getClusters().
+function DairyCoreManager:_readHerdClusters(placeable)
+    local cfg = mbCfg()
+    if placeable == nil then return nil, cfg.SOURCE_STANDARD end
+    local spec = placeable.spec_husbandryAnimals
+    if RLBridge.active and spec ~= nil and spec.clusterSystem ~= nil
+        and spec.clusterSystem.getAnimals ~= nil then
+        local animals = RLBridge:safeRead(function() return spec.clusterSystem:getAnimals() end, nil)
+        if type(animals) == "table" then return animals, cfg.SOURCE_RL end
+    end
+    if placeable.getClusters ~= nil then
+        local ok, clusters = pcall(function() return placeable:getClusters() end)
+        if ok and type(clusters) == "table" then return clusters, cfg.SOURCE_STANDARD end
+    end
+    return nil, cfg.SOURCE_STANDARD
+end
+
+local function mbResolveSubType(cluster)
+    if type(cluster) ~= "table" then return nil end
+    if cluster.getSubType ~= nil then
+        local ok, st = pcall(function() return cluster:getSubType() end)
+        if ok and type(st) == "table" then return st end
+    end
+    local index = nil
+    if cluster.getSubTypeIndex ~= nil then
+        local ok, i = pcall(function() return cluster:getSubTypeIndex() end)
+        if ok then index = i end
+    end
+    if index == nil then index = cluster.subTypeIndex end
+    if index == nil or g_currentMission == nil or g_currentMission.animalSystem == nil then return nil end
+    local ok, st = pcall(function() return g_currentMission.animalSystem:getSubTypeByIndex(index) end)
+    if ok and type(st) == "table" then return st end
+    return nil
+end
+
+local function mbClusterCount(cluster)
+    local n = nil
+    if cluster.getNumAnimals ~= nil then
+        local ok, v = pcall(function() return cluster:getNumAnimals() end)
+        if ok then n = v end
+    end
+    if n == nil then n = cluster.numAnimals end
+    if not mbIsFinite(n) then return 0 end
+    return math.max(0, math.floor(n))
+end
+
+local function mbHasMilkOutput(subType)
+    return subType ~= nil and type(subType.output) == "table" and subType.output.milk ~= nil
+end
+
+-- A milking sub type with no readable name is counted under the UNKNOWN token,
+-- never dropped, so the headcount stays whole.
+local function mbSubTypeName(subType)
+    if type(subType.name) == "string" and subType.name ~= "" then return subType.name end
+    return mbCfg().UNKNOWN_SUBTYPE
+end
+
+-- Server truth: milking-capable clusters only (sub type carries milk output),
+-- counted by animals. A cluster whose sub type cannot be resolved at all is
+-- not a milking claim and is left out; an unreadable herd is unavailable.
+function DairyCoreManager:_deriveHerdBreedComposition(barn)
+    local cfg = mbCfg()
+    local list, mode = self:_readHerdClusters(barn ~= nil and barn._placeable or nil)
+    if list == nil then return mbUnavailable(cfg.REASON.HERD_UNRESOLVED) end
+    local counts, total = {}, 0
+    local ok, err = pcall(function()
+        for _, cluster in pairs(list) do
+            local subType = mbResolveSubType(cluster)
+            if mbHasMilkOutput(subType) then
+                local n = mbClusterCount(cluster)
+                if n > 0 then
+                    local name = mbSubTypeName(subType)
+                    counts[name] = (counts[name] or 0) + n
+                    total = total + n
+                end
+            end
+        end
+    end)
+    if not ok then
+        DCLogger.debug("DC-27: herd read failed for barn %s: %s", tostring(barn.barnId), tostring(err))
+        return mbUnavailable(cfg.REASON.HERD_UNRESOLVED)
+    end
+    local fractions = {}
+    for name, n in pairs(counts) do
+        fractions[name] = total > 0 and (n / total) or 0
+    end
+    return { available = true, fractions = fractions, counts = counts,
+        totalMilkingHeadcount = total, sourceMode = mode, trust = DairyConstants.TRUST.SERVER }
+end
+
+-- Per-breed shares of this barn's production of one fill type right now
+-- (litres per hour per breed over the barn's total). Ritter answers per animal
+-- through getOutput("milk"); Standard uses the sub type's milk curve at the
+-- cluster's age exactly as onHusbandryAnimalsUpdate sums litersPerHour. nil
+-- when nothing produces, so the deposit is unknown rather than mis-attributed.
+function DairyCoreManager:_deriveMilkProductionShares(placeable, ftIndex)
+    local list = self:_readHerdClusters(placeable)
+    if list == nil then return nil end
+    local rates, total = {}, 0
+    local ok = pcall(function()
+        for _, cluster in pairs(list) do
+            local subType = mbResolveSubType(cluster)
+            if mbHasMilkOutput(subType) and subType.output.milk.fillType == ftIndex then
+                local rate = nil
+                if cluster.getOutput ~= nil then
+                    local okO, v = pcall(function() return cluster:getOutput("milk") end)
+                    if okO and mbIsFinite(v) then rate = v end
+                end
+                if rate == nil then
+                    local milk = subType.output.milk
+                    local age = 0
+                    if cluster.getAge ~= nil then
+                        local okA, a = pcall(function() return cluster:getAge() end)
+                        if okA and mbIsFinite(a) then age = a end
+                    end
+                    local perAnimal = 0
+                    if milk.curve ~= nil and milk.curve.get ~= nil then
+                        local okC, c = pcall(function() return milk.curve:get(age) end)
+                        if okC and mbIsFinite(c) then perAnimal = c end
+                    end
+                    rate = perAnimal * mbClusterCount(cluster) / 24
+                end
+                if rate > 0 then
+                    local name = mbSubTypeName(subType)
+                    rates[name] = (rates[name] or 0) + rate
+                    total = total + rate
+                end
+            end
+        end
+    end)
+    if not ok or total <= 0 then return nil end
+    local shares = {}
+    for name, r in pairs(rates) do shares[name] = r / total end
+    return shares
+end
+
+-- ---------------------------------------------------------
+-- One-Storage honesty (topology)
+-- ---------------------------------------------------------
+
+-- The one-Storage proof for (placeable, fill type). Returns the internal Storage
+-- when the barn's milk can reach exactly that Storage and nothing else, judged
+-- on the storages compatible with the fill type in the unloading station's
+-- targets and the loading station's sources; otherwise nil, the reason and the
+-- compatible target/source counts. An unreadable neighbour counts as a route.
+function DairyCoreManager:_resolveMilkProvenanceStorage(placeable, ftIndex)
+    local R = mbCfg().REASON
+    if type(ftIndex) ~= "number" then return nil, R.UNRESOLVED_FILLTYPE, 0, 0 end
+    local hus = placeable ~= nil and placeable.spec_husbandry or nil
+    local storage = hus ~= nil and hus.storage or nil
+    if storage == nil or storage.getFillLevel == nil then return nil, R.NO_INTERNAL_STORAGE, 0, 0 end
+    local okS, supported = pcall(function() return storage:getIsFillTypeSupported(ftIndex) end)
+    if not okS or supported ~= true then return nil, R.NO_INTERNAL_STORAGE, 0, 0 end
+    local unloading, loading = hus.unloadingStation, hus.loadingStation
+    if unloading == nil or loading == nil then return nil, R.NON_SINGLE_STORAGE_ROUTE, 0, 0 end
+    local targets, sources, foreign = 0, 0, false
+    local function compatible(s)
+        if s == storage then return true end
+        local ok, v = pcall(function() return s:getIsFillTypeSupported(ftIndex) end)
+        return (not ok) or v ~= false
+    end
+    local ok = pcall(function()
+        for s in pairs(unloading.targetStorages or {}) do
+            if compatible(s) then
+                targets = targets + 1
+                if s ~= storage then foreign = true end
+            end
+        end
+        local sourceSet = loading.sourceStorages
+        if loading.getSourceStorages ~= nil then sourceSet = loading:getSourceStorages() end
+        for s in pairs(sourceSet or {}) do
+            if compatible(s) then
+                sources = sources + 1
+                if s ~= storage then foreign = true end
+            end
+        end
+    end)
+    if not ok or foreign or targets ~= 1 or sources ~= 1 then
+        return nil, R.NON_SINGLE_STORAGE_ROUTE, targets, sources
+    end
+    return storage, nil, 1, 1
+end
+
+-- Log a topology verdict only when it changes for that (barn, fill type).
+function DairyCoreManager:_noteMilkBreedTopology(barn, name, eligible, targets, sources)
+    barn._milkBreedTopo = barn._milkBreedTopo or {}
+    local state = eligible and "ELIGIBLE" or "UNAVAILABLE"
+    if barn._milkBreedTopo[name] ~= state then
+        barn._milkBreedTopo[name] = state
+        mbLog("[DC27 TOPOLOGY] barn=%s fillType=%s result=%s targets=%d sources=%d",
+            tostring(barn.barnId), tostring(name), state, targets or 0, sources or 0)
+    end
+end
+
+-- ---------------------------------------------------------
+-- The record (server book)
+-- ---------------------------------------------------------
+
+function DairyCoreManager:_milkBreedRecord(barnId, name, create)
+    local byFt = self.milkBreed[barnId]
+    if byFt == nil then
+        if not create then return nil end
+        byFt = {}
+        self.milkBreed[barnId] = byFt
+    end
+    local rec = byFt[name]
+    if rec == nil and create then
+        rec = { litres = 0, fractions = {} }
+        byFt[name] = rec
+    end
+    return rec
+end
+
+function DairyCoreManager:_dropMilkBreedRecord(barnId, name)
+    local byFt = self.milkBreed[barnId]
+    if byFt == nil or byFt[name] == nil then return false end
+    byFt[name] = nil
+    if next(byFt) == nil then self.milkBreed[barnId] = nil end
+    return true
+end
+
+-- Bring the record for (barn, fill type) to `level` litres. A shortfall is a
+-- removal that keeps the tank's proportions. A surplus is known milk up to the
+-- open context's remaining budget at the context's shares, and unknown milk
+-- past that or with no context at all. Zero clears the record.
+function DairyCoreManager:_reconcileMilkBreed(barn, name, level, ctxEntry)
+    if level == nil then return nil end
+    local barnId = barn.barnId
+    local rec = self:_milkBreedRecord(barnId, name, false)
+    local before = rec ~= nil and rec.litres or 0
+    if level <= MB_EPS then
+        if rec ~= nil then
+            self:_dropMilkBreedRecord(barnId, name)
+            mbLog("[DC27 EVENT] barn=%s fillType=%s source=REMOVAL deltaL=%.3f beforeL=%.3f afterL=0.000 unknownL=0.000",
+                tostring(barnId), name, -before, before)
+            self:_markBreedSurfaceDirty()
+        end
+        return nil
+    end
+    if rec == nil then rec = self:_milkBreedRecord(barnId, name, true) end
+    local delta = level - before
+    if math.abs(delta) <= MB_EPS then
+        rec.litres = level
+        return rec
+    end
+    local source = "UNKNOWN"
+    if delta < 0 then
+        rec.litres = level
+        source = "REMOVAL"
+    else
+        local known = 0
+        if ctxEntry ~= nil and ctxEntry.fractions ~= nil then
+            known = math.min(delta, math.max(0, ctxEntry.remainingBudget or 0))
+            ctxEntry.remainingBudget = math.max(0, (ctxEntry.remainingBudget or 0) - known)
+        end
+        if known > MB_EPS then
+            mbBlend(rec, known, ctxEntry.fractions)
+            source = "BASE_MILK"
+        end
+        if delta - known > MB_EPS then
+            mbBlend(rec, delta - known, nil)
+        end
+        rec.litres = level
+    end
+    rec.fractions = mbPrune(rec.fractions)
+    mbLog("[DC27 EVENT] barn=%s fillType=%s source=%s deltaL=%.3f beforeL=%.3f afterL=%.3f unknownL=%.3f",
+        tostring(barnId), name, source, delta, before, level, level * mbUnknownShare(rec.fractions))
+    self:_markBreedSurfaceDirty()
+    return rec
+end
+
+function DairyCoreManager:_invalidateMilkBreed(barn, name, reason)
+    if self:_dropMilkBreedRecord(barn.barnId, name) then
+        mbLog("[DC27 EVENT] barn=%s fillType=%s source=INVALIDATE reason=%s",
+            tostring(barn.barnId), tostring(name), tostring(reason))
+        self:_markBreedSurfaceDirty()
+    end
+end
+
+-- Storage listener (server). Fires on any real level change of the barn's own
+-- Storage. The gap between the record and the pre-change level is not this
+-- change (unknown, or a removal); the change itself is known only inside the
+-- open production context for this barn and this Storage.
+function DairyCoreManager:_onMilkBreedFillChanged(barn, storage, ftIndex, delta)
+    if self.disabled or not self:_isServer() or barn._probeDead then return end
+    local name = mbFillTypeName(ftIndex)
+    if name == nil or not mbIsTrackedMilk(name) then return end
+    local placeable = barn._placeable
+    local eligible, reason, targets, sources = self:_resolveMilkProvenanceStorage(placeable, ftIndex)
+    self:_noteMilkBreedTopology(barn, name, eligible ~= nil, targets, sources)
+    if eligible == nil or eligible ~= storage then
+        self:_invalidateMilkBreed(barn, name, reason or mbCfg().REASON.NON_SINGLE_STORAGE_ROUTE)
+        return
+    end
+    local current = mbLevel(storage, ftIndex)
+    if current == nil then return end
+    local d = mbIsFinite(delta) and delta or 0
+    self:_reconcileMilkBreed(barn, name, math.max(0, current - d), nil)
+    local entry = nil
+    local ctx = self._milkBreedContext
+    if ctx ~= nil and ctx.placeable == placeable then
+        entry = ctx.entries[ftIndex]
+        if entry ~= nil and entry.storage ~= storage then entry = nil end
+    end
+    self:_reconcileMilkBreed(barn, name, current, entry)
+end
+
+-- One DC-27 listener per barn on the internal Storage (not the station the DC-9
+-- detector watches), re-bound when the Storage object changes.
+function DairyCoreManager:_attachMilkBreedListener(barn)
+    local placeable = barn._placeable
+    local storage = placeable ~= nil and placeable.spec_husbandry ~= nil
+        and placeable.spec_husbandry.storage or nil
+    local bound = barn._milkBreedListener
+    if bound ~= nil and bound.storage == storage then return end
+    if bound ~= nil then self:_detachMilkBreedListener(barn) end
+    if storage == nil or storage.addFillLevelChangedListeners == nil then return end
+    local fn = function(fillTypeIndex, delta)
+        local ok, err = pcall(self._onMilkBreedFillChanged, self, barn, storage, fillTypeIndex, delta)
+        if not ok then DCLogger.debug("DC-27: fill listener failed: %s", tostring(err)) end
+    end
+    local ok = pcall(function() storage:addFillLevelChangedListeners(fn) end)
+    if ok then barn._milkBreedListener = { storage = storage, fn = fn } end
+end
+
+function DairyCoreManager:_detachMilkBreedListener(barn)
+    local bound = barn._milkBreedListener
+    if bound == nil then return end
+    pcall(function()
+        if bound.storage ~= nil and bound.storage.removeFillLevelChangedListeners ~= nil then
+            bound.storage:removeFillLevelChangedListeners(bound.fn)
+        end
+    end)
+    barn._milkBreedListener = nil
+end
+
+-- The tracked milk fill types this barn produces, by name, sorted.
+function DairyCoreManager:_barnMilkFillTypeNames(barn)
+    local names = {}
+    local placeable = barn ~= nil and barn._placeable or nil
+    local spec = placeable ~= nil and placeable.spec_husbandryMilk or nil
+    if spec ~= nil and type(spec.fillTypes) == "table" then
+        for _, ftIndex in ipairs(spec.fillTypes) do
+            local name = mbFillTypeName(ftIndex)
+            if name ~= nil and mbIsTrackedMilk(name) then names[#names + 1] = name end
+        end
+    end
+    table.sort(names)
+    return names
+end
+
+-- Re-prove the route and settle the record to the tank's current level (a route
+-- that has just appeared seeds the whole level as unknown). Returns the eligible
+-- Storage, or nil and the reason.
+function DairyCoreManager:_refreshMilkBreedRecord(barn, name)
+    local cfg = mbCfg()
+    local ftIndex = mbFillTypeIndex(name)
+    if ftIndex == nil then return nil, cfg.REASON.UNRESOLVED_FILLTYPE end
+    local storage, reason, targets, sources = self:_resolveMilkProvenanceStorage(barn._placeable, ftIndex)
+    self:_noteMilkBreedTopology(barn, name, storage ~= nil, targets, sources)
+    if storage == nil then
+        self:_invalidateMilkBreed(barn, name, reason)
+        return nil, reason
+    end
+    local level = mbLevel(storage, ftIndex)
+    if level == nil then
+        self:_invalidateMilkBreed(barn, name, cfg.REASON.NO_INTERNAL_STORAGE)
+        return nil, cfg.REASON.NO_INTERNAL_STORAGE
+    end
+    self:_reconcileMilkBreed(barn, name, level, nil)
+    return storage, nil
+end
+
+-- Discovery hook (server): bind the listener and settle every tracked record.
+function DairyCoreManager:_refreshMilkBreedBarn(barn)
+    if self.disabled or not self:_isServer() or barn._placeable == nil then return end
+    self:_attachMilkBreedListener(barn)
+    for _, name in ipairs(self:_barnMilkFillTypeNames(barn)) do
+        self:_refreshMilkBreedRecord(barn, name)
+    end
+end
+
+-- Dead-barn hook from _reconcileBarns.
+function DairyCoreManager:_forgetMilkBreedBarn(barn, barnId)
+    self:_detachMilkBreedListener(barn)
+    if self.milkBreed[barnId] ~= nil then
+        self.milkBreed[barnId] = nil
+        self:_markBreedSurfaceDirty()
+    end
+end
+
+-- ---------------------------------------------------------
+-- Base-game messages (server)
+-- ---------------------------------------------------------
+
+function DairyCoreManager:_bindMilkBreedMessages()
+    if self._milkBreedMessagesBound or self.disabled or not self:_isServer() then return end
+    if g_messageCenter == nil or MessageType == nil then return end
+    pcall(function()
+        if MessageType.STORAGE_ADDED_TO_LOADING_STATION ~= nil then
+            g_messageCenter:subscribe(MessageType.STORAGE_ADDED_TO_LOADING_STATION, self._onMilkBreedStorageAdded, self)
+        end
+        if MessageType.STORAGE_ADDED_TO_UNLOADING_STATION ~= nil then
+            g_messageCenter:subscribe(MessageType.STORAGE_ADDED_TO_UNLOADING_STATION, self._onMilkBreedStorageAdded, self)
+        end
+        if MessageType.HUSBANDRY_ANIMALS_CHANGED ~= nil then
+            g_messageCenter:subscribe(MessageType.HUSBANDRY_ANIMALS_CHANGED, self._onMilkBreedAnimalsChanged, self)
+        end
+        self._milkBreedMessagesBound = true
+    end)
+end
+
+function DairyCoreManager:_unbindMilkBreedMessages()
+    if not self._milkBreedMessagesBound then return end
+    if g_messageCenter ~= nil and MessageType ~= nil then
+        pcall(function()
+            g_messageCenter:unsubscribe(MessageType.STORAGE_ADDED_TO_LOADING_STATION, self)
+            g_messageCenter:unsubscribe(MessageType.STORAGE_ADDED_TO_UNLOADING_STATION, self)
+            g_messageCenter:unsubscribe(MessageType.HUSBANDRY_ANIMALS_CHANGED, self)
+        end)
+    end
+    self._milkBreedMessagesBound = false
+end
+
+-- A Storage joined one of the barn's stations: re-prove the route. A second
+-- compatible Storage drops the record (NON_SINGLE_STORAGE_ROUTE).
+function DairyCoreManager:_onMilkBreedStorageAdded(storage, station)
+    if self.disabled or not self:_isServer() or station == nil then return end
+    for _, barn in pairs(self.barns) do
+        local p = barn._placeable
+        local hus = p ~= nil and p.spec_husbandry or nil
+        if hus ~= nil and (hus.unloadingStation == station or hus.loadingStation == station) then
+            for _, name in ipairs(self:_barnMilkFillTypeNames(barn)) do
+                self:_refreshMilkBreedRecord(barn, name)
+            end
+            self:_markBreedSurfaceDirty()
+        end
+    end
+end
+
+-- The herd changed: the composition is read live, so only the mirror is stale.
+-- A dairy barn not yet on the book (placed since the last pass) is discovered
+-- now so its next production hour is observed.
+function DairyCoreManager:_onMilkBreedAnimalsChanged(placeable)
+    if self.disabled or not self:_isServer() then return end
+    if placeable ~= nil and self:_isDairyBarn(placeable) and self:_barnForPlaceable(placeable) == nil then
+        self:discoverBarns()
+    end
+    self:_markBreedSurfaceDirty()
+end
+
+-- ---------------------------------------------------------
+-- Public getters (the version-1 read contract)
+-- ---------------------------------------------------------
+
+function DairyCoreManager:_mirrorEntry(barnId)
+    local m = self.breedSurfaceMirror
+    if not self.breedSurfaceMirrorReady or m == nil or m.byBarn == nil or barnId == nil then return nil end
+    return m.byBarn[barnId] or m.byBarn[tostring(barnId)]
+end
+
+-- { available = true, fractions = { [subTypeName] = share }, counts = { [subTypeName] = n },
+--   totalMilkingHeadcount = n, sourceMode = STANDARD|REALISTIC_LIVESTOCK, trust }
+-- or { available = false, reason, trust }. Server: read live. Client: mirror or waiting.
+function DairyCoreManager:getHerdBreedComposition(barn)
+    if type(barn) ~= "table" then return mbWaiting(DairyConstants.TRUST.UNKNOWN) end
+    if not self:_isServer() then
+        local m = self:_mirrorEntry(barn.barnId)
+        if m ~= nil and m.herd ~= nil then return m.herd end
+        return mbWaiting(DairyConstants.TRUST.UNKNOWN)
+    end
+    return self:_deriveHerdBreedComposition(barn)
+end
+
+-- { available = true, litres, knownLitres = { [subTypeName] = L }, unknownLitres,
+--   fractions = { [subTypeName] = share }, unknownShare, trust }
+-- or { available = false, reason, trust }. Server: re-proves the route and settles
+-- the record first. Client: mirror or waiting. Unavailable is never zero.
+function DairyCoreManager:getMilkBreedProvenance(barn, fillTypeName)
+    local cfg = mbCfg()
+    if type(barn) ~= "table" then return mbWaiting(DairyConstants.TRUST.UNKNOWN) end
+    if not self:_isServer() then
+        local m = self:_mirrorEntry(barn.barnId)
+        if m ~= nil and m.milk ~= nil and m.milk[fillTypeName] ~= nil then return m.milk[fillTypeName] end
+        return mbWaiting(DairyConstants.TRUST.UNKNOWN)
+    end
+    if type(fillTypeName) ~= "string" or not mbIsTrackedMilk(fillTypeName)
+        or mbFillTypeIndex(fillTypeName) == nil then
+        return mbUnavailable(cfg.REASON.UNRESOLVED_FILLTYPE)
+    end
+    if barn._placeable == nil then return mbUnavailable(cfg.REASON.NO_INTERNAL_STORAGE) end
+    local storage, reason = self:_refreshMilkBreedRecord(barn, fillTypeName)
+    if storage == nil then return mbUnavailable(reason) end
+    local rec = self:_milkBreedRecord(barn.barnId, fillTypeName, false)
+    local litres = rec ~= nil and rec.litres or 0
+    local fractions = rec ~= nil and mbCopy(rec.fractions) or {}
+    local known, sumKnown = {}, 0
+    for name, f in pairs(fractions) do
+        known[name] = litres * f
+        sumKnown = sumKnown + litres * f
+    end
+    return { available = true, litres = litres, knownLitres = known,
+        unknownLitres = math.max(0, litres - sumKnown), fractions = fractions,
+        unknownShare = mbUnknownShare(fractions), trust = DairyConstants.TRUST.SERVER }
+end
+
+-- getBarnRows() extension: the four version-1 members on every published row.
+function DairyCoreManager:_applyBreedSurfaceRow(row, b)
+    local cfg = mbCfg()
+    row.breedSurfaceVersion = cfg.ROW_VERSION
+    local fillTypeNames = self:_barnMilkFillTypeNames(b)
+    if self:_isServer() then
+        row.breedSurfaceFarmId = self:_isRealFarmId(b.farmId) and b.farmId or nil
+    else
+        local m = self:_mirrorEntry(b.barnId)
+        row.breedSurfaceFarmId = m ~= nil and m.farmId or nil
+        if #fillTypeNames == 0 and m ~= nil and m.milk ~= nil then
+            fillTypeNames = mbSortedKeys(m.milk)
+        end
+    end
+    if #fillTypeNames == 0 then fillTypeNames = { cfg.MILK_FILLTYPES[1] } end
+    row.herdBreedComposition = self:getHerdBreedComposition(b)
+    row.milkBreedProvenance = {}
+    for _, name in ipairs(fillTypeNames) do
+        row.milkBreedProvenance[name] = self:getMilkBreedProvenance(b, name)
+    end
+end
+
+-- ---------------------------------------------------------
+-- Persistence (StateLedger module; own-file rows when the ledger is absent)
+-- ---------------------------------------------------------
+
+-- { version = 1, barns = { [tostring(barnId)] = { [fillTypeName] = { litres, fractions } } } }
+-- Only records whose route still proves out and that hold milk.
+function DairyCoreManager:_serializeMilkBreed()
+    local out = { version = mbCfg().PERSIST_VERSION, barns = {} }
+    if self.disabled or not self:_isServer() then return out end
+    for _, barnId in ipairs(mbSortedKeys(self.milkBreed)) do
+        local barn = self.barns[barnId]
+        local byFt = self.milkBreed[barnId]
+        if barn ~= nil and barn._placeable ~= nil and not barn._probeDead and byFt ~= nil then
+            for _, name in ipairs(mbSortedKeys(byFt)) do
+                local storage = self:_refreshMilkBreedRecord(barn, name)
+                local rec = storage ~= nil and self:_milkBreedRecord(barnId, name, false) or nil
+                if rec ~= nil and rec.litres > MB_EPS then
+                    local key = tostring(barnId)
+                    out.barns[key] = out.barns[key] or {}
+                    out.barns[key][name] = { litres = rec.litres, fractions = mbCopy(rec.fractions) }
+                end
+            end
+        end
+    end
+    return out
+end
+
+function DairyCoreManager:_deserializeMilkBreed(data)
+    local cfg = mbCfg()
+    if type(data) ~= "table" then return end
+    if data.version ~= cfg.PERSIST_VERSION then
+        DCLogger.info("[DC27 PERSIST] path=STATELEDGER action=RESET_UNKNOWN reason=VERSION_%s", tostring(data.version))
+        return
+    end
+    local restored, barns = 0, 0
+    self.milkBreed = {}
+    for key, byFt in pairs(data.barns or {}) do
+        local barnId = tonumber(key) or key
+        if type(byFt) == "table" then
+            for name, rec in pairs(byFt) do
+                if type(name) == "string" and mbIsTrackedMilk(name) and type(rec) == "table"
+                    and mbIsFinite(rec.litres) and rec.litres > MB_EPS then
+                    local fr, sum = {}, 0
+                    for n, f in pairs(rec.fractions or {}) do
+                        if type(n) == "string" and mbIsFinite(f) and f > 0 then
+                            fr[n] = math.min(1, f)
+                            sum = sum + fr[n]
+                        end
+                    end
+                    -- Shares never sum past one; a save that says otherwise is scaled.
+                    if sum > 1 then
+                        for n, f in pairs(fr) do fr[n] = f / sum end
+                    end
+                    local target = self:_milkBreedRecord(barnId, name, true)
+                    target.litres = rec.litres
+                    target.fractions = mbPrune(fr)
+                    restored = restored + 1
+                end
+            end
+        end
+    end
+    for _ in pairs(self.milkBreed) do barns = barns + 1 end
+    DCLogger.info("[DC27 PERSIST] path=STATELEDGER action=RESTORE_KNOWN barns=%d records=%d", barns, restored)
+    self:_markBreedSurfaceDirty()
+end
+
+-- Own-file rows: one per (barn, fill type). The shares are written for the
+-- reader's eye; on load the litres come back as unknown milk (RESET_UNKNOWN),
+-- the own-file being the no-ledger fallback and not a provenance authority.
+function DairyCoreManager:_writeMilkBreedOwnFile(xml)
+    local data = self:_serializeMilkBreed()
+    local m = 0
+    for _, barnKey in ipairs(mbSortedKeys(data.barns)) do
+        for _, ft in ipairs(mbSortedKeys(data.barns[barnKey])) do
+            local rec = data.barns[barnKey][ft]
+            local key = string.format("dairyCore.milkBreed(%d)", m)
+            xml:setString(key .. "#barn", barnKey)
+            xml:setString(key .. "#ft", ft)
+            xml:setFloat(key .. "#litres", rec.litres)
+            local parts = {}
+            for _, n in ipairs(mbSortedKeys(rec.fractions)) do
+                parts[#parts + 1] = string.format("%s=%.6f", n, rec.fractions[n])
+            end
+            xml:setString(key .. "#fractions", table.concat(parts, ","))
+            m = m + 1
+        end
+    end
+end
+
+function DairyCoreManager:_readMilkBreedOwnFile(xml)
+    local n = 0
+    xml:iterate("dairyCore.milkBreed", function(_, key)
+        local rawId = xml:getString(key .. "#barn", "")
+        local ft = xml:getString(key .. "#ft", "")
+        local litres = xml:getFloat(key .. "#litres", 0)
+        if rawId ~= "" and mbIsTrackedMilk(ft) and mbIsFinite(litres) and litres > MB_EPS then
+            local rec = self:_milkBreedRecord(tonumber(rawId) or rawId, ft, true)
+            rec.litres = litres
+            rec.fractions = {}
+            n = n + 1
+        end
+    end)
+    if n > 0 then
+        DCLogger.info("[DC27 PERSIST] path=OWN_FILE action=RESET_UNKNOWN records=%d", n)
+        self:_markBreedSurfaceDirty()
+    end
+end
+
+-- ---------------------------------------------------------
+-- The mirror (NetworkSync module; direct event fallback)
+-- ---------------------------------------------------------
+-- Wire (dense, bool/int/float/string only):
+--   schema, barnCount, then per barn sorted by string id:
+--     barnId(string), farmId(int, 0 = none), sourceMode(string),
+--     herdAvailable(bool), herdReason(string, "" when available),
+--     totalMilkingHeadcount(int), breedCount(int), [name(string), count(int)]*,
+--     fillTypeCount(int), per fill type:
+--       name(string), available(bool), reason(string, "" when available),
+--       litres(number), unknownLitres(number), knownCount(int), [name(string), litres(number)]*
+
+function DairyCoreManager:_markBreedSurfaceDirty()
+    if not self:_isServer() then return end
+    self._breedSurfaceDirty = true
+    if self._breedSurfaceNsRegistered then
+        local ns = self:_getNetworkSync()
+        if ns ~= nil then pcall(function() ns:markDirty(mbCfg().NETWORK_MODULE) end) end
+    end
+end
+
+function DairyCoreManager:_buildBreedSurfaceSnapshot()
+    local cfg = mbCfg()
+    local arr = { cfg.SCHEMA }
+    local barnIds = {}
+    for barnId, b in pairs(self.barns) do
+        if not b._probeDead then barnIds[#barnIds + 1] = barnId end
+    end
+    table.sort(barnIds, function(a, b) return tostring(a) < tostring(b) end)
+    arr[#arr + 1] = #barnIds
+    for _, barnId in ipairs(barnIds) do
+        local b = self.barns[barnId]
+        local herd = self:getHerdBreedComposition(b)
+        arr[#arr + 1] = tostring(barnId)
+        arr[#arr + 1] = self:_isRealFarmId(b.farmId) and math.floor(b.farmId) or cfg.NONE_FARM
+        arr[#arr + 1] = herd.sourceMode or cfg.SOURCE_STANDARD
+        arr[#arr + 1] = herd.available == true
+        arr[#arr + 1] = herd.available and "" or tostring(herd.reason or cfg.REASON.HERD_UNRESOLVED)
+        arr[#arr + 1] = math.floor(herd.totalMilkingHeadcount or 0)
+        local names = mbSortedKeys(herd.counts)
+        arr[#arr + 1] = #names
+        for _, n in ipairs(names) do
+            arr[#arr + 1] = n
+            arr[#arr + 1] = math.floor(herd.counts[n] or 0)
+        end
+        local ftNames = self:_barnMilkFillTypeNames(b)
+        arr[#arr + 1] = #ftNames
+        for _, ft in ipairs(ftNames) do
+            local p = self:getMilkBreedProvenance(b, ft)
+            arr[#arr + 1] = ft
+            arr[#arr + 1] = p.available == true
+            if p.available then
+                arr[#arr + 1] = ""
+                arr[#arr + 1] = p.litres or 0
+                arr[#arr + 1] = p.unknownLitres or 0
+                local known = mbSortedKeys(p.knownLitres)
+                arr[#arr + 1] = #known
+                for _, n in ipairs(known) do
+                    arr[#arr + 1] = n
+                    arr[#arr + 1] = p.knownLitres[n] or 0
+                end
+            else
+                arr[#arr + 1] = tostring(p.reason or cfg.REASON.NO_INTERNAL_STORAGE)
+                arr[#arr + 1] = 0
+                arr[#arr + 1] = 0
+                arr[#arr + 1] = 0
+            end
+        end
+    end
+    return arr
+end
+
+function DairyCoreManager:_onWriteBreedSurfaceState()
+    return self:_buildBreedSurfaceSnapshot()
+end
+
+-- Cursor reader over the dense array; every read checks its type and raises
+-- with a reason string (level 0) that _applyBreedSurfaceSnapshot reports.
+local function mbReader(arr)
+    local pos = 1
+    local r = {}
+    local function take()
+        local v = arr[pos]
+        pos = pos + 1
+        if v == nil then error("SHORT_ARRAY@" .. (pos - 1), 0) end
+        return v
+    end
+    function r.str()
+        local v = take()
+        if type(v) ~= "string" then error("STRING_EXPECTED@" .. (pos - 1), 0) end
+        return v
+    end
+    function r.count()
+        local v = take()
+        if not mbIsFinite(v) or math.floor(v) ~= v or v < 0 then error("COUNT_EXPECTED@" .. (pos - 1), 0) end
+        return v
+    end
+    function r.num()
+        local v = take()
+        if not mbIsFinite(v) or v < 0 then error("NUMBER_EXPECTED@" .. (pos - 1), 0) end
+        return v
+    end
+    function r.bool()
+        local v = take()
+        if type(v) ~= "boolean" then error("BOOL_EXPECTED@" .. (pos - 1), 0) end
+        return v
+    end
+    function r.done()
+        return arr[pos] == nil
+    end
+    return r
+end
+
+-- Parse and validate one snapshot into a mirror table, or return { error = reason }.
+function DairyCoreManager:_parseBreedSurfaceSnapshot(arr)
+    local cfg = mbCfg()
+    local S = DairyConstants.TRUST.SERVER
+    if type(arr) ~= "table" then return { error = "NOT_A_TABLE" } end
+    local r = mbReader(arr)
+    local schema = r.str()
+    if schema ~= cfg.SCHEMA then return { error = "SCHEMA_MISMATCH:" .. schema } end
+    local barnCount = r.count()
+    local mirror = { byBarn = {}, barnCount = barnCount }
+    for _ = 1, barnCount do
+        local rawId = r.str()
+        local key = tonumber(rawId) or rawId
+        if mirror.byBarn[key] ~= nil then return { error = "DUPLICATE_BARN:" .. rawId } end
+        local farmId = r.count()
+        local sourceMode = r.str()
+        local herdAvailable = r.bool()
+        local herdReason = r.str()
+        local total = r.count()
+        local breedCount = r.count()
+        local counts, sumCounts = {}, 0
+        for _ = 1, breedCount do
+            local n = r.str()
+            local c = r.count()
+            if counts[n] ~= nil then return { error = "DUPLICATE_BREED:" .. n } end
+            counts[n] = c
+            sumCounts = sumCounts + c
+        end
+        local herd
+        if herdAvailable then
+            if sumCounts ~= total then return { error = "HERD_CONSERVATION:" .. rawId } end
+            local fractions = {}
+            for n, c in pairs(counts) do fractions[n] = total > 0 and (c / total) or 0 end
+            herd = { available = true, fractions = fractions, counts = counts,
+                totalMilkingHeadcount = total, sourceMode = sourceMode, trust = S }
+        else
+            if herdReason == "" then return { error = "MISSING_HERD_REASON:" .. rawId } end
+            herd = { available = false, reason = herdReason, trust = S }
+        end
+        local ftCount = r.count()
+        local milk = {}
+        for _ = 1, ftCount do
+            local ft = r.str()
+            if milk[ft] ~= nil then return { error = "DUPLICATE_FILLTYPE:" .. ft } end
+            local available = r.bool()
+            local reason = r.str()
+            local litres = r.num()
+            local unknown = r.num()
+            local knownCount = r.count()
+            local known, sumKnown = {}, 0
+            for _ = 1, knownCount do
+                local n = r.str()
+                local l = r.num()
+                if known[n] ~= nil then return { error = "DUPLICATE_COMPONENT:" .. n } end
+                known[n] = l
+                sumKnown = sumKnown + l
+            end
+            if available then
+                local components = sumKnown + unknown
+                if litres <= MB_EPS then
+                    if components > MB_EPS then return { error = "CONSERVATION_ZERO_TOTAL:" .. ft } end
+                    milk[ft] = { available = true, litres = 0, knownLitres = {}, unknownLitres = 0,
+                        fractions = {}, unknownShare = 1, trust = S }
+                else
+                    if components <= 0 then return { error = "CONSERVATION_NO_COMPONENTS:" .. ft } end
+                    local tolerance = cfg.CONSERVATION_ABS + litres * cfg.CONSERVATION_REL
+                    if math.abs(components - litres) > tolerance then
+                        return { error = "CONSERVATION_MISMATCH:" .. ft }
+                    end
+                    -- Normalize the float32 components back onto the total.
+                    local scale = litres / components
+                    local fractions, knownLitres = {}, {}
+                    for n, l in pairs(known) do
+                        local v = l * scale
+                        knownLitres[n] = v
+                        fractions[n] = math.min(1, math.max(0, v / litres))
+                    end
+                    local unknownLitres = unknown * scale
+                    milk[ft] = { available = true, litres = litres, knownLitres = knownLitres,
+                        unknownLitres = unknownLitres, fractions = fractions,
+                        unknownShare = math.min(1, math.max(0, unknownLitres / litres)), trust = S }
+                end
+            else
+                if reason == "" then return { error = "MISSING_REASON:" .. ft } end
+                milk[ft] = { available = false, reason = reason, trust = S }
+            end
+        end
+        mirror.byBarn[key] = { farmId = farmId > 0 and farmId or nil, herd = herd, milk = milk }
+    end
+    if not r.done() then return { error = "TRAILING_VALUES" } end
+    return { mirror = mirror }
+end
+
+-- The one validating entry point for both transports. Atomic: a rejected
+-- snapshot leaves the previous mirror untouched but marks it not ready, so a
+-- surface waits rather than reads a half-applied table. Returns true on apply.
+function DairyCoreManager:_applyBreedSurfaceSnapshot(arr, transport)
+    local cfg = mbCfg()
+    local ok, result = pcall(self._parseBreedSurfaceSnapshot, self, arr)
+    local reason = nil
+    if not ok then
+        reason = tostring(result)
+    elseif type(result) ~= "table" then
+        reason = "PARSE_RETURNED_" .. type(result)
+    elseif result.error ~= nil then
+        reason = tostring(result.error)
+    end
+    if reason ~= nil then
+        self.breedSurfaceMirrorReady = false
+        self.breedSurfaceMirrorError = reason
+        DCLogger.info("[DC27 SYNC] transport=%s action=REJECT schema=%s barns=0 reason=%s",
+            tostring(transport), cfg.SCHEMA, reason)
+        return false
+    end
+    self.breedSurfaceMirror = result.mirror
+    self.breedSurfaceMirrorReady = true
+    self.breedSurfaceMirrorError = nil
+    mbLog("[DC27 SYNC] transport=%s action=APPLY schema=%s barns=%d reason=OK",
+        tostring(transport), cfg.SCHEMA, result.mirror.barnCount or 0)
+    return true
+end
+
+-- Direct-event fallback (only when NetworkSync is absent or refused the module).
+function DairyCoreManager:_sendBreedSurfaceEvent(connection)
+    if DairyBreedSurfaceEvent == nil then return false end
+    local barns = 0
+    local ok, err = pcall(function()
+        local values = self:_buildBreedSurfaceSnapshot()
+        barns = values[2] or 0
+        local ev = DairyBreedSurfaceEvent.new(values)
+        if connection ~= nil then
+            connection:sendEvent(ev)
+        elseif g_server ~= nil then
+            g_server:broadcastEvent(ev)
+        end
+    end)
+    mbLog("[DC27 SYNC] transport=DIRECT_EVENT action=%s schema=%s barns=%d reason=%s",
+        connection ~= nil and "JOIN" or "BROADCAST", mbCfg().SCHEMA, barns, ok and "OK" or tostring(err))
+    return ok
+end
+
+-- Join: with NetworkSync the client requests the full snapshot itself; without
+-- it the server hands the joining connection one direct event.
+function DairyCoreManager:sendBreedSurfaceInitialState(connection)
+    if self.disabled or not self:_isServer() or connection == nil then return end
+    if self._breedSurfaceNsRegistered then return end
+    self:_sendBreedSurfaceEvent(connection)
+end
+
+-- Per-frame: the fallback broadcast, throttled to FALLBACK_DIRTY_MS, multiplayer only.
+function DairyCoreManager:_updateBreedSurfaceFallback(dt)
+    if not self._breedSurfaceDirty or self._breedSurfaceNsRegistered then return end
+    if self.disabled or not self:_isServer() or g_server == nil then return end
+    local mission = g_currentMission
+    if mission == nil or mission.missionDynamicInfo == nil or not mission.missionDynamicInfo.isMultiplayer then
+        self._breedSurfaceDirty = false
+        return
+    end
+    self._breedSurfaceAccum = (self._breedSurfaceAccum or 0) + (dt or 0)
+    if self._breedSurfaceAccum < mbCfg().FALLBACK_DIRTY_MS then return end
+    self._breedSurfaceAccum = 0
+    self._breedSurfaceDirty = false
+    self:_sendBreedSurfaceEvent(nil)
+end
+
+-- Mission delete: listeners off, messages off, context and mirror cleared, the
+-- class slot restored while it is still ours.
+function DairyCoreManager:_teardownMilkBreed()
+    for _, barn in pairs(self.barns) do
+        self:_detachMilkBreedListener(barn)
+        barn._milkBreedTopo = nil
+    end
+    self:_unbindMilkBreedMessages()
+    self._milkBreedContext = nil
+    self.milkBreed = {}
+    self.breedSurfaceMirror = nil
+    self.breedSurfaceMirrorReady = false
+    self.breedSurfaceMirrorError = nil
+    self._breedSurfaceNsRegistered = false
+    self._breedSurfaceDirty = false
+    self._breedSurfaceAccum = 0
+    DairyCoreManager._removeMilkBreedProductionWrapper()
 end

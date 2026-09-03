@@ -26,6 +26,9 @@ source(modDirectory .. "src/RLBridge.lua")
 source(modDirectory .. "src/FeedProvenance.lua")
 source(modDirectory .. "src/MilkTank.lua")
 source(modDirectory .. "src/DairyCoreManager.lua")
+-- DC-27: the direct-event fallback for the breed surface mirror (used only when
+-- NetworkSync is absent or refuses the module).
+source(modDirectory .. "src/network/DairyBreedSurfaceEvent.lua")
 
 -- Esc RF PDA framework joiner (NO-HOST).
 source(DairyCoreModDirectory .. "src/gui/RfEscModules.lua")
@@ -34,6 +37,11 @@ source(DairyCoreModDirectory .. "src/gui/RfEscBootstrap.lua")
 source(DairyCoreModDirectory .. "src/gui/RfEscUiDebugger.lua")
 source(DairyCoreModDirectory .. "src/gui/DairyRfPdaGuest.lua")
 source(DairyCoreModDirectory .. "src/gui/FeedDesignationDialog.lua")
+
+-- DC-27: put the milk production wrapper on the PlaceableHusbandryMilk class slot
+-- before TypeManager:finalizeTypes() captures it into the husbandry types. Guarded
+-- on slot identity inside, so a re-source never stacks a second wrapper.
+DairyCoreManager._installMilkBreedProductionWrapper()
 
 local dairyCore = DairyCoreManager.new()
 getfenv(0)["g_dairyCoreManager"] = dairyCore
@@ -79,6 +87,16 @@ else
 end
 
 FSBaseMission.delete = Utils.prependedFunction(FSBaseMission.delete, onMissionDelete)
+
+-- DC-27: a joining client gets the breed surface snapshot as one direct event
+-- when NetworkSync is not carrying the module (with NetworkSync the client pulls
+-- the full snapshot itself on join).
+if FSBaseMission ~= nil and FSBaseMission.sendInitialClientState ~= nil then
+    FSBaseMission.sendInitialClientState = Utils.appendedFunction(FSBaseMission.sendInitialClientState,
+        function(mission, connection, user, farm)
+            dairyCore:sendBreedSurfaceInitialState(connection)
+        end)
+end
 
 if addConsoleCommand ~= nil then
     addConsoleCommand("dairyStatus", "Show DairyCore barns, mode, contracts",
