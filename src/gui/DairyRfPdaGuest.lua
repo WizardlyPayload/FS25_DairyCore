@@ -22,9 +22,10 @@ local MOD_NAME = (DairyCoreModName or g_currentModName)
 local PANEL_ID = "dairy"
 local PANEL_ORDER = 70
 local MAX_ROWS = 8            -- the shared sheet's row count; Dairy hides every row
-local CARDS_PER_PAGE = 2      -- rfDairyCard1..2: 555x380 side by side in the 1140x428 bay
-local CARD_SLOTS = 4          -- rfDairyCard1..4 exist in the nine doors; 3 and 4 stay dark
-local TABLE_ROWS = 4          -- breed rows a herd or milk table shows per breed page
+-- BUILD 17:13 (George CLOSED DESIGN 17:00): 2x2 barn cards, 555x200 each, in the 1140x428 bay.
+local CARDS_PER_PAGE = 4      -- rfDairyCard1..4: 2 across by 2 down; empty slots hide
+local CARD_SLOTS = 4          -- rfDairyCard1..4 exist in the ten doors
+local TABLE_ROWS = 4          -- breed rows a herd or milk table shows per breed page (200px card)
 local _registered = false
 
 local function tr(key, fallback)
@@ -662,6 +663,94 @@ local function stepBreedPage(slot, delta)
     repaint()
 end
 
+-- ============================================================
+-- BUILD 00:06 (LAW Wizard Esc overlay-chip buttons 2026-09-05, George CLOSED DESIGN 23:12): every
+-- created button on this page paints as a vanilla key chip, the CsRfPdaGuest setPivotBtn /
+-- renderPivotChip / wirePivotChipPaint chain vendored. Idle = dark plate, lime text; latched =
+-- lime plate, dark text; gated = grey, no lime. The Button keeps its own hit box and onClick
+-- (RF_CsPivotBtn: buttonActivate chrome, hideKeyboardGlyph, no global-action trigger, so SPACE
+-- never confirms); its TextElement text stays "" so the chip is the only paint.
+-- ============================================================
+-- The engine text colour setter, captured here (no file-local helper shadows the name in this
+-- file, but the 20:36 Market crash is the reason this is never called by its bare name).
+local engineSetTextColor = setTextColor
+local CHIP_TEXT = { 0.22323, 0.40724, 0.00368 }
+local CHIP_BG = { 0.00913, 0.01033, 0.00651 }
+local CHIP_GATED_TEXT = { 0.62, 0.64, 0.66 }
+local CHIP_GATED_BG = { 0.06, 0.06, 0.065 }
+
+--- Store the chip state on the Button and blank its text. enabled=false paints the grey chip
+--- and disables the Button; latched inverts the live chip.
+local function setChipBtn(el, label, enabled, latched)
+    if el == nil then return end
+    if type(el.setText) == "function" then el:setText("") end
+    el.rfChipLabel = label
+    el.rfChipEnabled = enabled and true or false
+    el.rfChipLatched = latched and true or false
+    if type(el.setDisabled) == "function" then el:setDisabled(not enabled) end
+end
+
+local function renderChip(el, overlay)
+    local label = el.rfChipLabel
+    if label == nil or label == "" then return end
+    if el.absPosition == nil or el.absSize == nil or el.visible == false then return end
+    local height = el.absSize[2] * 0.72
+    if height <= 0 then return end
+    local t, b, ta, ba
+    if el.rfChipEnabled and el.rfChipLatched then
+        t, b, ta, ba = CHIP_BG, CHIP_TEXT, 1.0, 1.0
+    elseif el.rfChipEnabled then
+        t, b, ta, ba = CHIP_TEXT, CHIP_BG, 1.0, 1.0
+    else
+        t, b, ta, ba = CHIP_GATED_TEXT, CHIP_GATED_BG, 0.45, 0.55
+    end
+    overlay:setColor(t[1], t[2], t[3], ta, b[1], b[2], b[3], ba)
+    local width = overlay:getButtonWidth(label, height)
+    local x = el.absPosition[1] + (el.absSize[1] - width) * 0.5
+    local y = el.absPosition[2] + (el.absSize[2] - height) * 0.5
+    overlay:renderButton(label, x, y, height, true)
+end
+
+--- Wrap one already-visible parent's draw once (guard flag on the element) so the listed chips
+--- repaint every frame the parent draws. lookup(root, id) resolves each Button. The colour reset
+--- at the end is the ENGINE global captured above, never an element helper.
+local function wireChipPaint(parent, ids, flag, lookup)
+    if parent == nil or parent[flag] then return end
+    parent[flag] = true
+    local prevDraw = parent.draw
+    function parent:draw(...)
+        if prevDraw ~= nil then prevDraw(self, ...) end
+        local idm = g_inputDisplayManager
+        if idm == nil or type(idm.getKeyboardKeyOverlay) ~= "function" then return end
+        local overlay = idm:getKeyboardKeyOverlay()
+        if overlay == nil or type(overlay.renderButton) ~= "function" then return end
+        for _, id in ipairs(ids) do
+            local el = lookup(self, id)
+            if el ~= nil then
+                pcall(renderChip, el, overlay)
+            end
+        end
+        setTextBold(false)
+        setTextAlignment(RenderText.ALIGN_LEFT)
+        setTextVerticalAlignment(RenderText.VERTICAL_ALIGN_BASELINE)
+        if type(engineSetTextColor) == "function" then
+            engineSetTextColor(1, 1, 1, 1)
+        end
+    end
+end
+
+local DAIRY_CHIP_IDS = {
+    "rfDairyCard1BreedPrev", "rfDairyCard1BreedNext", "rfDairyCard2BreedPrev", "rfDairyCard2BreedNext",
+    "rfDairyCard3BreedPrev", "rfDairyCard3BreedNext", "rfDairyCard4BreedPrev", "rfDairyCard4BreedNext",
+}
+
+--- The wrap goes on rfFwTableBlock, the bay the four cards sit in.
+local function wireDairyChipPaint(container)
+    wireChipPaint(findDescendant(container, "rfFwTableBlock"), DAIRY_CHIP_IDS, "_rfDairyChipWired", function(root, id)
+        return findDescendant(root, id) or findOnPage(container, id)
+    end)
+end
+
 --- The in-card breed pager: hidden, blank and disabled unless the barn has more rows than
 --- a table page holds. The XML carries no onClick on purpose (an unbound Button is inert
 --- for every other door); this binds onClickCallback once per element instance, the way the
@@ -674,7 +763,7 @@ local function paintBreedPager(container, slot, pages, page)
         if el ~= nil then
             stripButtonGlyph(el)
             if type(el.setDisabled) == "function" then el:setDisabled(not multi) end
-            if not multi then setText(el, "") end
+            if not multi then setText(el, ""); el.rfChipLabel = nil end
             setVis(el, multi)
         end
     end
@@ -687,9 +776,11 @@ local function paintBreedPager(container, slot, pages, page)
         nextEl.onClickCallback = function() stepBreedPage(slot, 1) return true end
         nextEl.rfDairyBoundSlot = slot
     end
-    setText(prevEl, tr("dairy_rf_pda_breed_prev", "< Breeds"))
+    -- BUILD 00:06 (overlay-chip law): the labels ride the chips, the Buttons keep their
+    -- onClickCallback binding above.
+    setChipBtn(prevEl, tr("dairy_rf_pda_breed_prev", "< Breeds"), true, false)
     stripButtonGlyph(prevEl)
-    setText(nextEl, string.format(tr("dairy_rf_pda_breed_next", "Breeds (%d/%d) >"), page, pages))
+    setChipBtn(nextEl, string.format(tr("dairy_rf_pda_breed_next", "Breeds (%d/%d) >"), page, pages), true, false)
     stripButtonGlyph(nextEl)
 end
 
@@ -706,8 +797,10 @@ local function paintCard(container, slot, r, scoreMax, troughText)
     local page = breedPageOf(r, pages)
     paintTable(container, slot, "Herd", herdHeader, herdRows, page)
     paintTable(container, slot, "Milk", milkHeader, milkRows, page)
+    -- BUILD 20:36 (George CLOSED DESIGN 19:03): the 555x380 card is back, so the farm-wide
+    -- stored-feed readout paints inside the card again (rfDairyCardNStored at -252, three lines).
     local stored = cardEl(container, slot, "Stored")
-    setText(stored, troughText)
+    setText(stored, troughText or "")
     setVis(stored, true)
     paintBreedPager(container, slot, pages, page)
 end
@@ -733,9 +826,16 @@ local SIDE_TEACH_FALLBACK = "Dairy\n\n"
     .. "The trough draws from that pool and milk follows it. Organic means over 80% organic "
     .. "share. Waiting for harvest data until the first cut is recorded."
 
-local function paintSideTeach(container)
+--- BUILD 20:36: the page hint (barn count, more-barns note, spoilage-clock note, mycotoxin
+--- warnings) rides the side info under the teach text: two 380-tall card rows fill the 780 bay
+--- and leave no band for rfDairyCardsHint, which stays declared and hidden.
+local function paintSideTeach(container, tail)
     setVis(findDescendant(container, "rfSideInfoShell"), true)
-    setText(findDescendant(container, "rfSideInfoBody"), tr("dairy_rf_pda_side_teach", SIDE_TEACH_FALLBACK))
+    local body = tr("dairy_rf_pda_side_teach", SIDE_TEACH_FALLBACK)
+    if type(tail) == "string" and tail ~= "" then
+        body = body .. "\n\n" .. tail
+    end
+    setText(findDescendant(container, "rfSideInfoBody"), body)
 end
 
 -- ============================================================
@@ -927,6 +1027,7 @@ function DairyRfPdaGuest.onShow(container, lightOnly)
     -- host clears the body before this runs, so this is the last word on it for as long
     -- as Dairy is the active module.
     hideSheetChrome(container)
+    wireDairyChipPaint(container)
     paintSideTeach(container)
 
     -- DairyConstants.HERD.SCORE_MAX is the real bound DairyCoreManager clamps herdHealth
@@ -989,9 +1090,10 @@ function DairyRfPdaGuest.onShow(container, lightOnly)
     local first = (_pageIndex - 1) * CARDS_PER_PAGE
     local troughText = troughCardText(mgr, farmId, serverSide(mgr))
 
-    -- One card per barn, in barn order, never a card cut in half: a page holds two whole
-    -- barns and an empty slot stays an honest empty (hidden frame), the hint below says how
-    -- many barns sit on the pages after this one. Frames 3 and 4 are never shown.
+    -- One card per barn, in barn order, never a card cut in half: a page holds four whole
+    -- barns (2x2 since BUILD 17:13) and an empty slot stays an honest empty (hidden frame),
+    -- the hint below says how many barns sit on the pages after this one. The shared pager
+    -- only appears past four barns (pageCountFor).
     _lastContainer = container
     _pageRows = {}
     local painted = 0
@@ -1025,17 +1127,26 @@ function DairyRfPdaGuest.onShow(container, lightOnly)
         local warn = buildWarnFlavour(r)
         if warn ~= nil then warnBits[#warnBits + 1] = warn end
     end
+    local tailParts = {}
     if idleClock then
-        hintParts[#hintParts + 1] = tr(
+        tailParts[#tailParts + 1] = tr(
             "dairy_rf_pda_hint_spoil_idle",
             "Spoilage clock not started - Fresh does not mean a live ageing timer yet."
         )
     end
     if #warnBits > 0 then
-        hintParts[#hintParts + 1] = table.concat(warnBits, "; ")
+        tailParts[#tailParts + 1] = table.concat(warnBits, "; ")
     end
-    setText(hintEl, table.concat(hintParts, "  "))
-    setVis(hintEl, true)
+    -- BUILD 20:36: the hint (barns count and the more-barns note, then the spoilage-clock note
+    -- and the mycotoxin warnings) rides the side info; the stored-feed readout is back on each
+    -- card. rfDairyCardsHint stays declared, empty and hidden.
+    local hintText = table.concat(hintParts, "  ")
+    if #tailParts > 0 then
+        hintText = hintText .. "\n" .. table.concat(tailParts, "  ")
+    end
+    setText(hintEl, "")
+    setVis(hintEl, false)
+    paintSideTeach(container, hintText)
 end
 
 function DairyRfPdaGuest.onHide()
