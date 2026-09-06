@@ -21,6 +21,11 @@ the repo's git history and README.
   mycotoxin penalty actually fire.
 
 ### Fixed
+- Barn discovery now distinguishes live milk barns from saved records. Startup
+  retries preserve unresolved dairy state, rebind late-loading barns and notify
+  the existing barn and breed surfaces when visibility or ownership changes.
+  Diagnostics report live barns and stored records separately. Test package
+  version 1.0.5.24 distinguishes this correction from the earlier retry diagnostics.
 - Feed-field bonuses and penalties plus the mycotoxin penalty now apply in both
   Standard and RealisticLivestock (Ritter) modes. They previously ran only in the
   Standard score path, so a Ritter-mode farm was silently exempt (DC-11 placement).

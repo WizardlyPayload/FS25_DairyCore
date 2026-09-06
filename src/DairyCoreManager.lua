@@ -58,6 +58,9 @@ end
 -- =========================================================
 
 function DairyCoreManager:onMissionLoaded()
+    self._discoveryRetries = 0
+    self._discoveryTimer = 0
+    self._discoveryPending = true
     -- Zero Precision Farming compatibility: stand down fully if PF is present.
     if g_modIsLoaded ~= nil and g_modIsLoaded["FS25_precisionFarming"] then
         self.disabled = true
@@ -75,7 +78,7 @@ function DairyCoreManager:onMissionLoaded()
 
     self:_subscribeClock()
     self:_bindActions()
-    self:discoverBarns()
+    self:discoverBarns(true)
     -- FP-1: subscribe to SF's soilHarvestBus on the server so grain harvests seed
     -- the farm's feed provenance. Delegate-when-present and read-only.
     self:_bindHarvestBus()
@@ -91,8 +94,8 @@ function DairyCoreManager:onMissionLoaded()
         end
     end)
 
-    DCLogger.info("DairyCore active (%s mode, %d barn(s))",
-        RLBridge.active and "Ritter" or "Standard", self:_countBarns())
+    DCLogger.info("DairyCore active (%s mode, %d live barn(s), %d stored record(s))",
+        RLBridge.active and "Ritter" or "Standard", self:_countLiveBarns(), self:_countBarns())
 end
 
 function DairyCoreManager:onMissionDelete()
@@ -114,22 +117,34 @@ end
 
 -- DC-32: on a dedicated server and on a client join, onMissionLoaded can fire before the
 -- placeable list is populated, so the first discovery finds 0 barns and nothing re-runs
--- it until the next day tick (too late for a fresh view). Retry every 500 ms until barns
--- appear or a 10 s cap is hit, and say which way it went.
+-- it until the next day tick (too late for a fresh view). Saved records are not live
+-- bindings. Retry every 500 ms until all known barns bind, or 20 attempts complete.
+-- Startup misses hide unresolved rows but must not erase their saved dairy state.
 function DairyCoreManager:_retryDiscovery(dt)
-    if self._discoveryRetries ~= nil and self._discoveryRetries >= 20 then return end
-    if self:_countBarns() > 0 then return end
+    if self._discoveryRetries ~= nil and self._discoveryRetries >= 20 then
+        self._discoveryPending = false
+        return
+    end
+    local live = self:_countLiveBarns()
+    if live > 0 and live == self:_countBarns() then
+        self._discoveryPending = false
+        return
+    end
     self._discoveryTimer = (self._discoveryTimer or 0) + dt
     if self._discoveryTimer < 500 then return end
     self._discoveryTimer = 0
     self._discoveryRetries = (self._discoveryRetries or 0) + 1
-    self:discoverBarns()
-    if self:_countBarns() > 0 then
-        DCLogger.info("DairyCore discovery found %d barn(s) on retry %d",
-            self:_countBarns(), self._discoveryRetries)
+    self:discoverBarns(true)
+    live = self:_countLiveBarns()
+    local stored = self:_countBarns()
+    if live > 0 and live == stored then
+        self._discoveryPending = false
+        DCLogger.info("DairyCore discovery bound %d live barn(s), %d stored record(s), on retry %d",
+            live, stored, self._discoveryRetries)
     elseif self._discoveryRetries >= 20 then
-        DCLogger.warning("DairyCore discovery still 0 barn(s) after %d attempts - placeables may not be loaded",
-            self._discoveryRetries)
+        self._discoveryPending = false
+        DCLogger.warning("DairyCore discovery: %d live barn(s), %d stored record(s), after %d attempts - unresolved records retained",
+            live, stored, self._discoveryRetries)
     end
 end
 
@@ -146,6 +161,14 @@ end
 function DairyCoreManager:_countBarns()
     local n = 0
     for _ in pairs(self.barns) do n = n + 1 end
+    return n
+end
+
+function DairyCoreManager:_countLiveBarns()
+    local n = 0
+    for _, barn in pairs(self.barns) do
+        if barn._placeable ~= nil and not barn._probeDead then n = n + 1 end
+    end
     return n
 end
 
@@ -214,14 +237,19 @@ function DairyCoreManager:_farmIdsToScan()
     return {}
 end
 
-function DairyCoreManager:discoverBarns()
+function DairyCoreManager:discoverBarns(retainUnresolved)
     if self.disabled then return end
     local mission = g_currentMission
     if mission == nil then return end
 
     -- Clear every transient placeable ref so reconcile can tell a barn that was not
     -- re-registered this pass (sold, demolished) from one that was.
-    for _, barn in pairs(self.barns) do
+    -- Compare the published census after reconciliation, including owner changes
+    -- and newly bound barns with no milk yet. Milk changes alone cannot notify these.
+    local previous = {}
+    for barnId, barn in pairs(self.barns) do
+        previous[barnId] = { placeable = barn._placeable, farmId = barn.farmId,
+            visible = not barn._probeDead }
         barn._placeable = nil
     end
 
@@ -262,11 +290,22 @@ function DairyCoreManager:discoverBarns()
 
     -- DC-9 repair 5 + the milk-round listeners: drop records that are provably dead,
     -- clear the rota on a farm change, and start watching every live barn's storage.
-    self:_reconcileBarns()
+    self:_reconcileBarns(retainUnresolved == true or self._discoveryPending == true)
+    local changed = false
     for _, barn in pairs(self.barns) do
+        local old = previous[barn.barnId]
+        if old == nil or old.placeable ~= barn._placeable or old.farmId ~= barn.farmId
+            or old.visible ~= (not barn._probeDead) then
+            changed = true
+        end
+        previous[barn.barnId] = nil
         self:_attachStorageListeners(barn)
         -- DC-27: the internal Storage listener and the record refresh.
         self:_refreshMilkBreedBarn(barn)
+    end
+    if changed or next(previous) ~= nil then
+        self:_markBarnsDirty()
+        self:_markBreedSurfaceDirty()
     end
 end
 
@@ -329,6 +368,12 @@ function DairyCoreManager:_getOrCreateBarn(barnId, farmId, placeable)
             herdHealthScore_RitterSource = false,
         }
         self.barns[barnId] = barn
+    end
+    -- Registration sees the new owner before reconciliation does. Clear the old
+    -- farm's collection assignment here, before overwriting that evidence.
+    if farmId ~= nil and self:_isRealFarmId(barn.farmId) and barn.farmId ~= farmId then
+        barn.assignedWorkerId = nil
+        barn.rotaState = DairyConstants.COLLECTION.ROTA_STATES.UNASSIGNED
     end
     barn.farmId = farmId or barn.farmId
     barn._placeable = placeable  -- transient runtime reference, not saved
@@ -974,21 +1019,24 @@ end
 -- record whose placeable no longer resolves, and clear the rota when the resolved
 -- farm differs from the stored one (a barn that changes hands resolves fine, it is
 -- simply somebody else's now).
-function DairyCoreManager:_reconcileBarns()
+function DairyCoreManager:_reconcileBarns(retainUnresolved)
     for barnId, barn in pairs(self.barns) do
         local p = barn._placeable
         if p == nil then
             -- Placeable unresolved this pass (fresh discovery may not have reached
             -- it yet); only drop records we can prove dead.
-            if barn._probeDead then
+            if barn._probeDead and not retainUnresolved and not barn._startupUnresolved then
                 self:_detachStorageListeners(barn)
                 self:_forgetMilkBreedBarn(barn, barnId)
                 self.barns[barnId] = nil
             else
                 barn._probeDead = true
+                -- A startup miss is not one of the two normal removal probes.
+                barn._startupUnresolved = retainUnresolved == true
             end
         else
             barn._probeDead = nil
+            barn._startupUnresolved = nil
             if barn.farmId ~= nil and p.getOwnerFarmId ~= nil then
                 local owner = nil
                 pcall(function() owner = p:getOwnerFarmId() end)
